@@ -204,5 +204,3 @@ Build Docker image:
 ```bash
 docker compose build
 ```
-
-Hi!
