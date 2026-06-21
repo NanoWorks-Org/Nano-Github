@@ -1,0 +1,15 @@
+services:
+  nano-github:
+    build: .
+    container_name: nano-github
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${API_PORT:-8080}:${API_PORT:-8080}"
+    volumes:
+      - nano-github-data:/data
+
+volumes:
+  nano-github-data:
+
