@@ -6,7 +6,7 @@ It deliberately separates read-only logging from pull request review:
 
 - **Logging channels** receive normal GitHub event embeds for commits, issues, issue comments, and releases.
 - **Pull request review channels** receive interactive PR review cards with buttons that submit GitHub Pull Request Reviews through the Nano GitHub GitHub App.
-- **Discord issue creation** lets server members create GitHub suggestions and bug reports through the Nano GitHub GitHub App without needing GitHub accounts.
+- **Discord issue creation** lets server members create labeled GitHub issues through the Nano GitHub GitHub App without needing GitHub accounts.
 
 ## Features
 
@@ -121,6 +121,7 @@ Then configure Nano GitHub in Discord:
 /github set_log_channel releases #github-releases
 /github set_pr_review_channel #pull-request-review
 /github set_review_mode anyone
+/github dashboard
 /github status
 ```
 
@@ -136,10 +137,10 @@ to remove linked repositories for the server.
 
 Issue creation is configured per Discord server and always checks that the selected GitHub repository is linked to that same server.
 
-Server owners or members with Manage Server can configure it:
+Server admins can configure it:
 
 ```text
-/issue configure default_repo_owner default_repo_name suggestion bug #issue-submissions
+/issue configure default_repo_owner default_repo_name suggestion bug allowed_labels:"suggestion, bug, enhancement, feature, not a bug" default_labels:"suggestion" submission_log_channel:#issue-submissions
 /issue status
 /issue disable
 ```
@@ -147,8 +148,8 @@ Server owners or members with Manage Server can configure it:
 Normal server members can create issues unless issue creation has been disabled:
 
 ```text
-/issue create type:suggestion title:"Add dark mode" description:"Please add a dark theme."
-/issue create type:bug title:"Sync failed" description:"The webhook did not post." owner:nanoworks repo:nano-github
+/issue create title:"Add dark mode" description:"Please add a dark theme." labels:"enhancement, feature"
+/issue create title:"Sync failed" description:"The webhook did not post." type:bug owner:nanoworks repo:nano-github
 ```
 
 Repository selection works like this:
@@ -158,7 +159,11 @@ Repository selection works like this:
 - If no default is configured and the server has exactly one linked repository, Nano GitHub uses it automatically.
 - If multiple repositories are linked and no default or explicit repository is available, Nano GitHub asks the user to specify `owner` and `repo`.
 
-Suggestions receive the configured suggestion label, defaulting to `suggestion`. Bugs receive the configured bug label, defaulting to `bug`. If GitHub rejects the labels because they do not exist, the issue is still created and the Discord reply mentions that labels could not be applied.
+Labels are optional and comma-separated. If `labels` is provided, Nano GitHub applies those labels. If `labels` is blank and `type:suggestion` or `type:bug` is used, Nano GitHub applies the configured quick-default suggestion or bug label. If neither is provided, Nano GitHub applies the configured default labels for the server, if any.
+
+Admins can configure allowed labels and default labels per server. When allowed labels are configured, user-provided labels outside that list are skipped and reported in the command response. Nano GitHub does not assume global label names; labels such as `suggestion`, `bug`, `enhancement`, `feature`, and `not a bug` are examples only. If a requested GitHub label does not exist on the selected repository, the issue is still created, valid labels are applied, and the Discord reply lists the labels that failed.
+
+When `/issue create` creates a GitHub issue, Nano GitHub records the issue URL and number. If the GitHub `issues.opened` webhook arrives for that same issue, Nano GitHub suppresses the duplicate public issue-log embed while keeping the user command success response and the optional issue submission log.
 
 Created GitHub issues include the submitted description plus a short Discord source footer containing only the Discord username.
 
@@ -209,9 +214,11 @@ Pull requests are workflow events. They are not posted to normal log channels. T
 The button behavior is:
 
 - **View Pull Request** opens GitHub and does not require GitHub API permissions.
-- **Approve** submits a Pull Request Review with event `APPROVE`.
-- **Request Changes** submits a Pull Request Review with event `REQUEST_CHANGES`.
-- **Comment** opens a Discord modal, collects review text, and submits a Pull Request Review with event `COMMENT`.
+- **Approve** submits a Pull Request Review with event `APPROVE` and the body `Approved from Discord by <Discord username>.`
+- **Request Changes** opens a Discord modal, requires a short reason, and submits a Pull Request Review with event `REQUEST_CHANGES`.
+- **Comment** opens a Discord modal, collects review text, and submits a Pull Request Review with event `COMMENT` prefixed with `Comment from Discord by <Discord username>:`.
+
+After Approve, Request Changes, or Comment succeeds on GitHub, Nano GitHub edits the original PR review card and adds or updates a `Latest Review Activity` field with the action, Discord username, short reason or comment when provided, and timestamp. The View Pull Request button remains on updated cards, and the review buttons use persistent custom IDs so they continue working after bot restarts.
 
 Review actions use a repository installation token for the linked repository. The GitHub App must have `Pull requests: Read and write` permission. If the permission is missing, Nano GitHub replies with a friendly Discord error such as:
 
@@ -227,6 +234,8 @@ PR review actions are configured per Discord server:
 
 Use `/github app_status owner repo` to verify repository installation, installation token generation, issue creation permission, and pull request review permission.
 
+Use `/github dashboard` to open an ephemeral command dashboard with buttons for setup, repository settings, log channels, PR review settings, issue creation settings, webhook/app info, and status. Dashboard actions and all setup/configuration/status commands are admin-only. Normal users can run `/issue create` when issue creation is enabled.
+
 Required GitHub App repository permissions:
 
 - Metadata: read-only, required by GitHub Apps.
@@ -240,6 +249,7 @@ Required GitHub App repository permissions:
 - Events for repositories not linked to a Discord server are ignored.
 - If a channel is not configured for an event, the event is skipped and a warning is logged.
 - PR review cards are updated when Nano GitHub has already stored a Discord message for that PR.
+- Issue webhooks for issues created by `/issue create` are deduplicated against the recorded issue URL/number to avoid duplicate public issue embeds.
 
 ## Development Checks
 

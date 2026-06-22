@@ -26,6 +26,8 @@ class CreatedIssue:
     title: str
     url: str
     labels_applied: bool
+    labels: tuple[str, ...] = ()
+    failed_labels: tuple[str, ...] = ()
     label_error: str | None = None
 
 
@@ -145,20 +147,43 @@ def create_issue(
     if not isinstance(number, int) or not isinstance(url, str):
         raise GitHubAPIError(502, "GitHub issue response was missing issue details.")
 
+    applied_labels: list[str] = []
+    failed_labels: list[str] = []
     labels_applied = not labels
     label_error: str | None = None
     if labels:
         try:
-            _request_json(
-                "POST",
-                f"/repos/{_quote(owner)}/{_quote(repo)}/issues/{number}/labels",
-                token=access.token,
-                payload={"labels": labels},
-            )
-            labels_applied = True
+            repository_labels = _repository_label_names(owner, repo, access.token)
         except GitHubAPIError as exc:
+            return CreatedIssue(
+                owner=owner,
+                repo=repo,
+                number=number,
+                title=created_title if isinstance(created_title, str) else title,
+                url=url,
+                labels_applied=False,
+                failed_labels=tuple(labels),
+                label_error=f"GitHub label lookup failed ({exc.status_code}).",
+            )
+        valid_labels = [label for label in labels if label.lower() in repository_labels]
+        failed_labels = [label for label in labels if label.lower() not in repository_labels]
+        if valid_labels:
+            try:
+                _request_json(
+                    "POST",
+                    f"/repos/{_quote(owner)}/{_quote(repo)}/issues/{number}/labels",
+                    token=access.token,
+                    payload={"labels": valid_labels},
+                )
+                applied_labels = valid_labels
+            except GitHubAPIError as exc:
+                failed_labels = labels
+                label_error = f"GitHub rejected issue labels ({exc.status_code})."
+        if failed_labels and label_error is None:
+            label_error = "These labels do not exist: " + ", ".join(failed_labels)
+        labels_applied = bool(labels) and not failed_labels and len(applied_labels) == len(labels)
+        if valid_labels and not applied_labels:
             labels_applied = False
-            label_error = f"GitHub rejected issue labels ({exc.status_code})."
 
     return CreatedIssue(
         owner=owner,
@@ -167,8 +192,33 @@ def create_issue(
         title=created_title if isinstance(created_title, str) else title,
         url=url,
         labels_applied=labels_applied,
+        labels=tuple(applied_labels),
+        failed_labels=tuple(failed_labels),
         label_error=label_error,
     )
+
+
+def _repository_label_names(owner: str, repo: str, token: str) -> set[str]:
+    labels: set[str] = set()
+    page = 1
+    while True:
+        page_labels = _request_json(
+            "GET",
+            f"/repos/{_quote(owner)}/{_quote(repo)}/labels?per_page=100&page={page}",
+            token=token,
+        )
+        if not isinstance(page_labels, list):
+            raise GitHubAPIError(502, "GitHub labels response was malformed.")
+        labels.update(
+            label["name"].strip().lower()
+            for label in page_labels
+            if isinstance(label, dict)
+            and isinstance(label.get("name"), str)
+            and label["name"].strip()
+        )
+        if len(page_labels) < 100:
+            return labels
+        page += 1
 
 
 def submit_pull_request_review(

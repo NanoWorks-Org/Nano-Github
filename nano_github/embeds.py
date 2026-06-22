@@ -276,7 +276,8 @@ def issue_submission_success_embed(
     *,
     issue_title: str,
     issue_number: int,
-    issue_type: str,
+    labels: tuple[str, ...],
+    failed_labels: tuple[str, ...],
     repository: str,
     submitted_by: str,
     issue_url: str,
@@ -290,20 +291,22 @@ def issue_submission_success_embed(
         color=color,
     )
     embed.add_field(name="Issue", value=f"#{issue_number}", inline=True)
-    embed.add_field(name="Type", value=issue_type, inline=True)
+    embed.add_field(name="Labels", value=_label_names(labels), inline=True)
     embed.add_field(name="Repository", value=f"`{repository}`", inline=True)
     embed.add_field(name="Submitted by", value=submitted_by, inline=True)
     embed.add_field(name="GitHub issue", value=f"[Open issue]({issue_url})", inline=False)
     if not labels_applied:
         embed.add_field(
-            name="Labels",
+            name="Label warnings",
             value=(
-                f"Issue created, but labels could not be applied. {label_error}"
+                f"Issue created, but some labels could not be applied. {label_error}"
                 if label_error
-                else "Issue created, but labels could not be applied."
+                else "Issue created, but some labels could not be applied."
             ),
             inline=False,
         )
+    if failed_labels:
+        embed.add_field(name="Rejected labels", value=_label_names(failed_labels), inline=False)
     embed.set_footer(text="Nano GitHub issue submission")
     return embed
 
@@ -312,7 +315,7 @@ def issue_submission_log_embed(
     *,
     issue_title: str,
     issue_number: int,
-    issue_type: str,
+    labels: tuple[str, ...],
     repository: str,
     submitted_by: str,
     channel_id: int,
@@ -324,7 +327,7 @@ def issue_submission_log_embed(
         color=NANO_DARK_BLUE,
     )
     embed.add_field(name="Issue", value=f"#{issue_number}", inline=True)
-    embed.add_field(name="Type", value=issue_type, inline=True)
+    embed.add_field(name="Labels", value=_label_names(labels), inline=True)
     embed.add_field(name="Repository", value=f"`{repository}`", inline=True)
     embed.add_field(name="Submitted by", value=submitted_by, inline=True)
     embed.add_field(name="Channel", value=f"<#{channel_id}>", inline=True)
@@ -409,6 +412,12 @@ def _labels(labels: Any) -> str:
             names.append(f"`{name.strip()}`")
 
     return _truncate(", ".join(names), 900) if names else "None"
+
+
+def _label_names(labels: tuple[str, ...]) -> str:
+    if not labels:
+        return "None"
+    return _truncate(", ".join(f"`{label}`" for label in labels), 900)
 
 
 def _commit_title_and_body(message: Any) -> tuple[str, str]:

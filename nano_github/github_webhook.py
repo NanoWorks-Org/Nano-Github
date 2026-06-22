@@ -114,6 +114,16 @@ async def github_webhook(
         LOGGER.info("Ignoring unsupported GitHub event %s", event)
         return {"ignored": True, "reason": "unsupported event"}
 
+    if log_event_type == "issues" and action == "opened":
+        guild_ids = [
+            guild_id
+            for guild_id in guild_ids
+            if not _is_command_created_issue(db, guild_id, owner, repo, payload)
+        ]
+        if not guild_ids:
+            LOGGER.info("Suppressing duplicate issue log for Discord-created %s/%s issue", owner, repo)
+            return {"accepted": True, "event": event, "guilds": 0, "deduplicated": True}
+
     messages = _log_messages(log_event_type, payload)
     if not messages:
         LOGGER.info(
@@ -315,6 +325,33 @@ def _log_messages(event_type: str, payload: dict[str, Any]) -> list[embeds.Embed
     if event_type == "releases":
         return [embeds.EmbedMessage(embeds.release_embed(payload))]
     raise ValueError(f"Unsupported log event type: {event_type}")
+
+
+def _is_command_created_issue(
+    db: Database,
+    guild_id: int,
+    owner: str,
+    repo: str,
+    payload: dict[str, Any],
+) -> bool:
+    issue = payload.get("issue") or {}
+    issue_number = issue.get("number")
+    issue_url = issue.get("html_url")
+    if db.has_issue_submission(
+        guild_id,
+        owner,
+        repo,
+        issue_number=issue_number if isinstance(issue_number, int) else None,
+        issue_url=issue_url if isinstance(issue_url, str) else None,
+    ):
+        return True
+
+    body = issue.get("body")
+    return (
+        isinstance(body, str)
+        and "Submitted from Discord" in body
+        and "Discord username:" in body
+    )
 
 
 def _requested_reviewer_logins(pr: dict[str, Any]) -> list[str]:

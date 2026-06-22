@@ -56,6 +56,8 @@ class IssueSettings:
     default_repo: str | None
     suggestion_label: str
     bug_label: str
+    allowed_labels: tuple[str, ...]
+    default_labels: tuple[str, ...]
     submission_log_channel_id: int | None
     enabled: bool
 
@@ -173,6 +175,8 @@ class Database:
                     default_repo TEXT,
                     suggestion_label TEXT NOT NULL DEFAULT 'suggestion',
                     bug_label TEXT NOT NULL DEFAULT 'bug',
+                    allowed_labels TEXT NOT NULL DEFAULT '[]',
+                    default_labels TEXT NOT NULL DEFAULT '[]',
                     submission_log_channel_id INTEGER,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -209,6 +213,7 @@ class Database:
             )
             self._ensure_webhook_secret_column()
             self._ensure_pr_message_review_columns()
+            self._ensure_issue_settings_label_columns()
 
     def upsert_guild(self, guild_id: int, guild_name: str | None = None) -> None:
         with self._lock, self._connection:
@@ -628,11 +633,15 @@ class Database:
         default_repo: str,
         suggestion_label: str = "suggestion",
         bug_label: str = "bug",
+        allowed_labels: list[str] | tuple[str, ...] | None = None,
+        default_labels: list[str] | tuple[str, ...] | None = None,
         submission_log_channel_id: int | None = None,
     ) -> IssueSettings:
         default_owner, default_repo = _normalize_repo(default_owner, default_repo)
         suggestion_label = _normalize_label(suggestion_label, "suggestion")
         bug_label = _normalize_label(bug_label, "bug")
+        allowed_labels_json = json.dumps(_normalize_label_list(allowed_labels or []))
+        default_labels_json = json.dumps(_normalize_label_list(default_labels or []))
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -642,15 +651,19 @@ class Database:
                     default_repo,
                     suggestion_label,
                     bug_label,
+                    allowed_labels,
+                    default_labels,
                     submission_log_channel_id,
                     enabled
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     default_owner = excluded.default_owner,
                     default_repo = excluded.default_repo,
                     suggestion_label = excluded.suggestion_label,
                     bug_label = excluded.bug_label,
+                    allowed_labels = excluded.allowed_labels,
+                    default_labels = excluded.default_labels,
                     submission_log_channel_id = excluded.submission_log_channel_id,
                     enabled = 1,
                     updated_at = CURRENT_TIMESTAMP
@@ -661,6 +674,8 @@ class Database:
                     default_repo,
                     suggestion_label,
                     bug_label,
+                    allowed_labels_json,
+                    default_labels_json,
                     submission_log_channel_id,
                 ),
             )
@@ -680,6 +695,8 @@ class Database:
                     default_repo,
                     suggestion_label,
                     bug_label,
+                    allowed_labels,
+                    default_labels,
                     submission_log_channel_id,
                     enabled
                 FROM issue_settings
@@ -726,6 +743,28 @@ class Database:
     ) -> IssueSubmission:
         owner, repo = _normalize_repo(owner, repo)
         with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT
+                    id,
+                    guild_id,
+                    channel_id,
+                    user_id,
+                    owner,
+                    repo,
+                    issue_number,
+                    issue_url,
+                    issue_type,
+                    title,
+                    created_at
+                FROM issue_submissions
+                WHERE guild_id = ? AND owner = ? AND repo = ? AND issue_number = ?
+                """,
+                (guild_id, owner, repo, issue_number),
+            ).fetchone()
+            if row is not None:
+                return _issue_submission_from_row(row)
+
             cursor = self._connection.execute(
                 """
                 INSERT INTO issue_submissions (
@@ -753,6 +792,7 @@ class Database:
                     title,
                 ),
             )
+            submission_id = cursor.lastrowid
             row = self._connection.execute(
                 """
                 SELECT
@@ -770,12 +810,45 @@ class Database:
                 FROM issue_submissions
                 WHERE id = ?
                 """,
-                (cursor.lastrowid,),
+                (submission_id,),
             ).fetchone()
 
         if row is None:
             raise RuntimeError("Failed to record issue submission")
         return _issue_submission_from_row(row)
+
+    def has_issue_submission(
+        self,
+        guild_id: int,
+        owner: str,
+        repo: str,
+        issue_number: int | None = None,
+        issue_url: str | None = None,
+    ) -> bool:
+        owner, repo = _normalize_repo(owner, repo)
+        with self._lock:
+            if issue_number is not None:
+                row = self._connection.execute(
+                    """
+                    SELECT 1
+                    FROM issue_submissions
+                    WHERE guild_id = ? AND owner = ? AND repo = ? AND issue_number = ?
+                    """,
+                    (guild_id, owner, repo, issue_number),
+                ).fetchone()
+                if row:
+                    return True
+            if issue_url:
+                row = self._connection.execute(
+                    """
+                    SELECT 1
+                    FROM issue_submissions
+                    WHERE guild_id = ? AND owner = ? AND repo = ? AND issue_url = ?
+                    """,
+                    (guild_id, owner, repo, issue_url),
+                ).fetchone()
+                return row is not None
+        return False
 
     def _ensure_webhook_secret_column(self) -> None:
         columns = {
@@ -821,6 +894,20 @@ class Database:
                 "ALTER TABLE pr_messages ADD COLUMN requested_teams TEXT NOT NULL DEFAULT '[]'"
             )
 
+    def _ensure_issue_settings_label_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(issue_settings)").fetchall()
+        }
+        if "allowed_labels" not in columns:
+            self._connection.execute(
+                "ALTER TABLE issue_settings ADD COLUMN allowed_labels TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "default_labels" not in columns:
+            self._connection.execute(
+                "ALTER TABLE issue_settings ADD COLUMN default_labels TEXT NOT NULL DEFAULT '[]'"
+            )
+
 
 def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:
     return owner.strip().lower(), repo.strip().lower()
@@ -830,6 +917,18 @@ def _normalize_label(value: str | None, fallback: str) -> str:
     if not value or not value.strip():
         return fallback
     return value.strip()
+
+
+def _normalize_label_list(values: list[str] | tuple[str, ...]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        label = value.strip()
+        key = label.lower()
+        if label and key not in seen:
+            normalized.append(label)
+            seen.add(key)
+    return normalized
 
 
 def _normalize_names(values: list[str] | tuple[str, ...]) -> set[str]:
@@ -880,6 +979,8 @@ def _issue_settings_from_row(row: sqlite3.Row) -> IssueSettings:
         default_repo=row["default_repo"],
         suggestion_label=row["suggestion_label"],
         bug_label=row["bug_label"],
+        allowed_labels=_json_string_tuple(row["allowed_labels"]),
+        default_labels=_json_string_tuple(row["default_labels"]),
         submission_log_channel_id=int(log_channel_id) if log_channel_id is not None else None,
         enabled=bool(row["enabled"]),
     )

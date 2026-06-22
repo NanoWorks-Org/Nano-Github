@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 from typing import Literal
 
@@ -49,12 +50,99 @@ class PullRequestCommentModal(discord.ui.Modal, title="Comment on Pull Request")
         self.pr_message = pr_message
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        comment = str(self.review_body.value).strip()
+        discord_name = _display_name(interaction.user)
         await _submit_pr_review(
             interaction,
             self.pr_message,
             "COMMENT",
-            str(self.review_body.value),
+            f"Comment from Discord by {discord_name}:\n\n{comment}",
+            activity_detail=comment,
         )
+
+
+class PullRequestChangesModal(discord.ui.Modal, title="Request Pull Request Changes"):
+    reason = discord.ui.TextInput(
+        label="Short reason",
+        style=discord.TextStyle.paragraph,
+        min_length=1,
+        max_length=1000,
+    )
+
+    def __init__(self, pr_message: PrMessage) -> None:
+        super().__init__()
+        self.pr_message = pr_message
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        reason = str(self.reason.value).strip()
+        await _submit_pr_review(
+            interaction,
+            self.pr_message,
+            "REQUEST_CHANGES",
+            reason,
+            activity_detail=reason,
+        )
+
+
+class GitHubDashboardView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Setup", style=discord.ButtonStyle.primary, row=0)
+    async def setup_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await _send_dashboard_section(interaction, "Setup")
+
+    @discord.ui.button(label="Repository settings", style=discord.ButtonStyle.secondary, row=0)
+    async def repository_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await _send_dashboard_section(interaction, "Repository settings")
+
+    @discord.ui.button(label="Log channels", style=discord.ButtonStyle.secondary, row=0)
+    async def logs_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await _send_dashboard_section(interaction, "Log channels")
+
+    @discord.ui.button(label="PR review settings", style=discord.ButtonStyle.secondary, row=0)
+    async def pr_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await _send_dashboard_section(interaction, "PR review settings")
+
+    @discord.ui.button(label="Issue creation settings", style=discord.ButtonStyle.secondary, row=1)
+    async def issues_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await _send_dashboard_section(interaction, "Issue creation settings")
+
+    @discord.ui.button(label="Webhook/App info", style=discord.ButtonStyle.secondary, row=1)
+    async def app_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await _send_dashboard_section(interaction, "Webhook/App info")
+
+    @discord.ui.button(label="Status", style=discord.ButtonStyle.secondary, row=1)
+    async def status_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await _send_dashboard_section(interaction, "Status")
 
 
 class PullRequestReviewView(discord.ui.View):
@@ -100,7 +188,8 @@ class PullRequestReviewView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
-        await _handle_pr_review_button(interaction, "APPROVE")
+        body = f"Approved from Discord by {_display_name(interaction.user)}."
+        await _handle_pr_review_button(interaction, "APPROVE", body)
 
     @discord.ui.button(
         label="Request Changes",
@@ -113,8 +202,12 @@ class PullRequestReviewView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
-        body = f"Changes requested from Discord by {_display_name(interaction.user)}."
-        await _handle_pr_review_button(interaction, "REQUEST_CHANGES", body)
+        pr_message = await _resolve_pr_message_for_interaction(interaction)
+        if pr_message is None:
+            return
+        if not await _can_use_pr_review_action(interaction, pr_message):
+            return
+        await interaction.response.send_modal(PullRequestChangesModal(pr_message))
 
     @discord.ui.button(
         label="Comment",
@@ -463,6 +556,8 @@ async def status(interaction: discord.Interaction) -> None:
     if guild_id is None:
         await interaction.response.send_message("Run this command in a server.", ephemeral=True)
         return
+    if not await _ensure_manage_guild(interaction):
+        return
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
     config = db.get_status(guild_id)
@@ -501,6 +596,34 @@ async def status(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@github_group.command(name="dashboard", description="Open the Nano GitHub configuration dashboard.")
+async def dashboard(interaction: discord.Interaction) -> None:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        await interaction.response.send_message("Run this command in a server.", ephemeral=True)
+        return
+    if not await _ensure_manage_guild(interaction):
+        return
+
+    embed = discord.Embed(
+        title="Nano GitHub Dashboard",
+        description="Choose a configuration area below.",
+        color=embeds.NANO_BLUE,
+    )
+    embed.add_field(name="Setup", value="Initialize the bot and link repositories.", inline=False)
+    embed.add_field(name="Logs", value="Configure event channels and review cards.", inline=False)
+    embed.add_field(
+        name="Issues",
+        value="Configure Discord issue creation labels and defaults.",
+        inline=False,
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=GitHubDashboardView(),
+        ephemeral=True,
+    )
+
+
 @github_group.command(name="unlink_repo", description="Unlink all GitHub repositories from this server.")
 async def unlink_repo(interaction: discord.Interaction) -> None:
     guild_id = _require_guild(interaction)
@@ -521,9 +644,10 @@ async def unlink_repo(interaction: discord.Interaction) -> None:
 @issue_group.command(name="create", description="Create a GitHub issue from Discord.")
 @app_commands.rename(issue_type="type")
 @app_commands.describe(
-    issue_type="Create a suggestion or bug report",
     title="GitHub issue title",
     description="GitHub issue description",
+    labels="Optional comma-separated GitHub labels",
+    issue_type="Optional quick default label",
     owner="GitHub repository owner or organization",
     repo="GitHub repository name",
 )
@@ -535,9 +659,10 @@ async def unlink_repo(interaction: discord.Interaction) -> None:
 )
 async def create_issue(
     interaction: discord.Interaction,
-    issue_type: app_commands.Choice[str],
     title: str,
     description: str,
+    labels: str | None = None,
+    issue_type: app_commands.Choice[str] | None = None,
     owner: str | None = None,
     repo: str | None = None,
 ) -> None:
@@ -574,8 +699,12 @@ async def create_issue(
 
     await interaction.response.defer(thinking=True)
 
-    label = _label_for_issue_type(settings, issue_type.value)
-    body = _issue_body(interaction, issue_type.value, description)
+    requested_labels, blocked_labels = _labels_for_issue_create(
+        settings,
+        labels,
+        issue_type.value if issue_type else None,
+    )
+    body = _issue_body(interaction, description)
     try:
         created_issue = await asyncio.to_thread(
             github_create_issue,
@@ -583,7 +712,7 @@ async def create_issue(
             linked_repo.repo,
             title,
             body,
-            [label] if label else [],
+            requested_labels,
         )
     except GitHubAppNotInstalled:
         LOGGER.warning(
@@ -634,7 +763,7 @@ async def create_issue(
         repo=linked_repo.repo,
         issue_number=created_issue.number,
         issue_url=created_issue.url,
-        issue_type=issue_type.value,
+        issue_type=_label_summary(requested_labels),
         title=created_issue.title,
     )
     LOGGER.info(
@@ -648,15 +777,19 @@ async def create_issue(
 
     submitted_by = _display_name(interaction.user)
     repository = f"{linked_repo.owner}/{linked_repo.repo}"
+    label_error = _combined_label_error(created_issue.label_error, blocked_labels)
+    labels_applied = created_issue.labels_applied and not blocked_labels
+    failed_labels = tuple(blocked_labels) + created_issue.failed_labels
     success_embed = embeds.issue_submission_success_embed(
         issue_title=created_issue.title,
         issue_number=created_issue.number,
-        issue_type=issue_type.value,
+        labels=created_issue.labels,
+        failed_labels=failed_labels,
         repository=repository,
         submitted_by=submitted_by,
         issue_url=created_issue.url,
-        labels_applied=created_issue.labels_applied,
-        label_error=created_issue.label_error,
+        labels_applied=labels_applied,
+        label_error=label_error,
     )
     await interaction.followup.send(embed=success_embed)
 
@@ -666,7 +799,7 @@ async def create_issue(
             settings.submission_log_channel_id,
             issue_title=created_issue.title,
             issue_number=created_issue.number,
-            issue_type=issue_type.value,
+            labels=created_issue.labels,
             repository=repository,
             submitted_by=submitted_by,
             source_channel_id=int(interaction.channel_id),
@@ -680,6 +813,8 @@ async def create_issue(
     default_repo_name="Default linked GitHub repository name",
     suggestion_label="Label used for suggestions",
     bug_label="Label used for bug reports",
+    allowed_labels="Optional comma-separated labels users may choose",
+    default_labels="Optional comma-separated labels used when /issue create labels is blank",
     submission_log_channel="Optional Discord channel for issue submission logs",
 )
 async def configure_issue_creation(
@@ -688,6 +823,8 @@ async def configure_issue_creation(
     default_repo_name: str,
     suggestion_label: str = "suggestion",
     bug_label: str = "bug",
+    allowed_labels: str | None = None,
+    default_labels: str | None = None,
     submission_log_channel: discord.TextChannel | None = None,
 ) -> None:
     guild_id = _require_guild(interaction)
@@ -716,6 +853,8 @@ async def configure_issue_creation(
         linked_repo.repo,
         suggestion_label=suggestion_label,
         bug_label=bug_label,
+        allowed_labels=_parse_comma_labels(allowed_labels),
+        default_labels=_parse_comma_labels(default_labels),
         submission_log_channel_id=submission_log_channel.id if submission_log_channel else None,
     )
 
@@ -855,6 +994,7 @@ async def _submit_pr_review(
     pr_message: PrMessage,
     event: str,
     body: str | None = None,
+    activity_detail: str | None = None,
 ) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
@@ -893,6 +1033,12 @@ async def _submit_pr_review(
         await interaction.followup.send(_friendly_pr_review_error(exc), ephemeral=True)
         return
 
+    await _update_pr_review_activity(
+        interaction,
+        pr_message,
+        event,
+        activity_detail,
+    )
     await interaction.followup.send(
         _pr_review_success_message(event, review.url),
         ephemeral=True,
@@ -947,6 +1093,81 @@ def _permission_status(permission: str | None, allowed: bool) -> str:
     return f"{level} ({'ready' if allowed else 'missing write access'})"
 
 
+async def _update_pr_review_activity(
+    interaction: discord.Interaction,
+    pr_message: PrMessage,
+    event: str,
+    detail: str | None,
+) -> None:
+    channel = await _resolve_text_channel(interaction.client, pr_message.channel_id)  # type: ignore[arg-type]
+    if channel is None:
+        LOGGER.warning("Could not update PR review card; channel %s unavailable", pr_message.channel_id)
+        return
+
+    try:
+        message = await channel.fetch_message(pr_message.message_id)
+    except discord.NotFound:
+        LOGGER.warning("Could not update PR review card; message %s unavailable", pr_message.message_id)
+        return
+    except discord.Forbidden:
+        LOGGER.warning("Missing permission to update PR review card in channel %s", pr_message.channel_id)
+        return
+    except discord.HTTPException:
+        LOGGER.exception("Failed to fetch PR review card %s", pr_message.message_id)
+        return
+
+    if message.embeds:
+        embed = discord.Embed.from_dict(message.embeds[0].to_dict())
+    else:
+        embed = discord.Embed(
+            title=f"Pull Request #{pr_message.pr_number}",
+            url=_pr_url(pr_message),
+            color=embeds.NANO_DARK_BLUE,
+        )
+
+    for index, field in enumerate(embed.fields):
+        if field.name == "Latest Review Activity":
+            embed.remove_field(index)
+            break
+
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    value_lines = [
+        f"Action: {_review_activity_label(event)}",
+        f"Discord user: {_display_name(interaction.user)}",
+        f"Time: <t:{timestamp}:f>",
+    ]
+    if detail:
+        value_lines.insert(2, f"Note: {_short_text(detail)}")
+    embed.add_field(name="Latest Review Activity", value="\n".join(value_lines), inline=False)
+
+    try:
+        await message.edit(embed=embed, view=PullRequestReviewView(_pr_url(pr_message)))
+    except discord.Forbidden:
+        LOGGER.warning("Missing permission to edit PR review card in channel %s", pr_message.channel_id)
+    except discord.HTTPException:
+        LOGGER.exception("Failed to update PR review card %s", pr_message.message_id)
+
+
+def _pr_url(pr_message: PrMessage) -> str:
+    return f"https://github.com/{pr_message.owner}/{pr_message.repo}/pull/{pr_message.pr_number}"
+
+
+def _review_activity_label(event: str) -> str:
+    labels = {
+        "APPROVE": "Approved",
+        "REQUEST_CHANGES": "Requested changes",
+        "COMMENT": "Commented",
+    }
+    return labels.get(event, event.replace("_", " ").title())
+
+
+def _short_text(value: str, limit: int = 180) -> str:
+    value = " ".join(value.split())
+    if len(value) <= limit:
+        return value
+    return f"{value[: limit - 1].rstrip()}..."
+
+
 def _friendly_pr_review_error(exc: GitHubAPIError) -> str:
     if exc.status_code == 403 and (
         "resource not accessible" in exc.message.lower()
@@ -983,15 +1204,67 @@ def _discord_identity_names(user: discord.abc.User) -> set[str]:
     return {name.strip().lower() for name in names if name and name.strip()}
 
 
+def _labels_for_issue_create(
+    settings: IssueSettings | None,
+    labels: str | None,
+    issue_type: str | None,
+) -> tuple[list[str], list[str]]:
+    parsed_labels = _parse_comma_labels(labels)
+    if parsed_labels:
+        selected_labels = parsed_labels
+    elif issue_type:
+        selected_labels = [_label_for_issue_type(settings, issue_type)]
+    elif settings and settings.default_labels:
+        selected_labels = list(settings.default_labels)
+    else:
+        selected_labels = []
+
+    if not settings or not settings.allowed_labels:
+        return selected_labels, []
+
+    allowed = {label.lower() for label in settings.allowed_labels}
+    accepted = [label for label in selected_labels if label.lower() in allowed]
+    blocked = [label for label in selected_labels if label.lower() not in allowed]
+    return accepted, blocked
+
+
 def _label_for_issue_type(settings: IssueSettings | None, issue_type: str) -> str:
     if issue_type == "bug":
         return settings.bug_label if settings else "bug"
     return settings.suggestion_label if settings else "suggestion"
 
 
+def _parse_comma_labels(labels: str | None) -> list[str]:
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for raw_label in (labels or "").split(","):
+        label = raw_label.strip()
+        key = label.lower()
+        if label and key not in seen:
+            parsed.append(label)
+            seen.add(key)
+    return parsed
+
+
+def _label_summary(labels: list[str] | tuple[str, ...]) -> str:
+    return ", ".join(labels) if labels else "unlabeled"
+
+
+def _label_list_display(labels: list[str] | tuple[str, ...]) -> str:
+    return ", ".join(f"`{label}`" for label in labels) if labels else "None"
+
+
+def _combined_label_error(github_error: str | None, blocked_labels: list[str]) -> str | None:
+    errors = []
+    if blocked_labels:
+        errors.append("Not allowed in this server: " + ", ".join(blocked_labels))
+    if github_error:
+        errors.append(github_error)
+    return " ".join(errors) if errors else None
+
+
 def _issue_body(
     interaction: discord.Interaction,
-    _issue_type: str,
     description: str,
 ) -> str:
     return "\n".join(
@@ -1017,6 +1290,8 @@ def _issue_status_embed(settings: IssueSettings | None) -> discord.Embed:
         embed.add_field(name="Default repository", value="Not configured", inline=True)
         embed.add_field(name="Suggestion label", value="suggestion", inline=True)
         embed.add_field(name="Bug label", value="bug", inline=True)
+        embed.add_field(name="Allowed labels", value="Any linked repository label", inline=False)
+        embed.add_field(name="Default labels", value="None", inline=False)
         embed.add_field(name="Log channel", value="Not configured", inline=True)
         return embed
 
@@ -1029,6 +1304,16 @@ def _issue_status_embed(settings: IssueSettings | None) -> discord.Embed:
     embed.add_field(name="Default repository", value=default_repo, inline=True)
     embed.add_field(name="Suggestion label", value=f"`{settings.suggestion_label}`", inline=True)
     embed.add_field(name="Bug label", value=f"`{settings.bug_label}`", inline=True)
+    embed.add_field(
+        name="Allowed labels",
+        value=_label_list_display(settings.allowed_labels) if settings.allowed_labels else "Any",
+        inline=False,
+    )
+    embed.add_field(
+        name="Default labels",
+        value=_label_list_display(settings.default_labels),
+        inline=False,
+    )
     embed.add_field(
         name="Log channel",
         value=f"<#{settings.submission_log_channel_id}>"
@@ -1045,7 +1330,7 @@ async def _send_issue_submission_log(
     *,
     issue_title: str,
     issue_number: int,
-    issue_type: str,
+    labels: tuple[str, ...],
     repository: str,
     submitted_by: str,
     source_channel_id: int,
@@ -1062,7 +1347,7 @@ async def _send_issue_submission_log(
     embed = embeds.issue_submission_log_embed(
         issue_title=issue_title,
         issue_number=issue_number,
-        issue_type=issue_type,
+        labels=labels,
         repository=repository,
         submitted_by=submitted_by,
         channel_id=source_channel_id,
@@ -1077,6 +1362,54 @@ async def _send_issue_submission_log(
         )
     except discord.HTTPException:
         LOGGER.exception("Failed to send issue submission log to channel %s", log_channel_id)
+
+
+async def _send_dashboard_section(interaction: discord.Interaction, section: str) -> None:
+    if not await _ensure_manage_guild(interaction):
+        return
+
+    embed = discord.Embed(title=f"Nano GitHub: {section}", color=embeds.NANO_BLUE)
+    commands_by_section = {
+        "Setup": [
+            "/github setup",
+            "/github link_repo owner repo",
+            "/github dashboard",
+        ],
+        "Repository settings": [
+            "/github link_repo owner repo",
+            "/github unlink_repo",
+            "/github status",
+        ],
+        "Log channels": [
+            "/github set_log_channel commits #channel",
+            "/github set_log_channel issues #channel",
+            "/github set_log_channel comments #channel",
+            "/github set_log_channel releases #channel",
+        ],
+        "PR review settings": [
+            "/github set_pr_review_channel #channel",
+            "/github set_review_mode anyone",
+            "/github set_review_mode discord_role role:@role",
+        ],
+        "Issue creation settings": [
+            "/issue configure default_repo_owner default_repo_name",
+            "/issue status",
+            "/issue disable",
+        ],
+        "Webhook/App info": [
+            "/github webhook_info owner repo",
+            "/github rotate_secret owner repo",
+            "/github app_status owner repo",
+        ],
+        "Status": [
+            "/github status",
+            "/issue status",
+            "/github app_status owner repo",
+        ],
+    }
+    commands_list = commands_by_section.get(section, ["/github status"])
+    embed.description = "\n".join(f"`{command}`" for command in commands_list)
+    await interaction.response.edit_message(embed=embed, view=GitHubDashboardView())
 
 
 async def _resolve_text_channel(
