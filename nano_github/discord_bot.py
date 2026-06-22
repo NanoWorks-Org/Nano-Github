@@ -35,6 +35,18 @@ LOG_EVENT_TYPES = ("commits", "issues", "comments", "releases")
 LogEventType = Literal["commits", "issues", "comments", "releases"]
 WEBHOOK_PAYLOAD_URL = "https://api.nanoworks.co.uk/webhooks/github"
 WEBHOOK_EVENTS = "Pushes, Issues, Issue comments, Pull requests, Releases"
+DASHBOARD_ACCESS_MESSAGE = (
+    "You need Administrator or Manage Server permission to use the Nano GitHub dashboard."
+)
+DASHBOARD_SECTIONS = {
+    "overview": "Overview",
+    "repositories": "Repositories",
+    "logs": "Log Channels",
+    "pr_reviews": "PR Reviews",
+    "issues": "Issue Creation",
+    "github_app": "GitHub App",
+    "webhook": "Webhook Info",
+}
 
 
 class PullRequestCommentModal(discord.ui.Modal, title="Comment on Pull Request"):
@@ -56,7 +68,7 @@ class PullRequestCommentModal(discord.ui.Modal, title="Comment on Pull Request")
             interaction,
             self.pr_message,
             "COMMENT",
-            f"Comment from Discord by {discord_name}:\n\n{comment}",
+            f"Comment from Discord by {discord_name}: {comment}",
             activity_detail=comment,
         )
 
@@ -75,74 +87,285 @@ class PullRequestChangesModal(discord.ui.Modal, title="Request Pull Request Chan
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         reason = str(self.reason.value).strip()
+        discord_name = _display_name(interaction.user)
         await _submit_pr_review(
             interaction,
             self.pr_message,
             "REQUEST_CHANGES",
-            reason,
+            f"Requested changes from Discord by {discord_name}: {reason}",
             activity_detail=reason,
         )
 
 
-class GitHubDashboardView(discord.ui.View):
+class IssueLabelsModal(discord.ui.Modal, title="Configure Issue Labels"):
+    allowed_labels = discord.ui.TextInput(
+        label="Allowed labels",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000,
+        placeholder="suggestion, bug, enhancement, feature",
+    )
+    default_labels = discord.ui.TextInput(
+        label="Default labels",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=500,
+        placeholder="suggestion",
+    )
+
+    def __init__(self, guild_id: int, settings: IssueSettings | None) -> None:
+        super().__init__()
+        self.guild_id = guild_id
+        if settings:
+            self.allowed_labels.default = ", ".join(settings.allowed_labels)
+            self.default_labels.default = ", ".join(settings.default_labels)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        if interaction.guild_id != self.guild_id:
+            await interaction.response.send_message(
+                "This dashboard control belongs to another server.",
+                ephemeral=True,
+            )
+            return
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        settings = db.get_issue_settings(self.guild_id)
+        if settings is None or not settings.default_owner or not settings.default_repo:
+            await interaction.response.send_message(
+                "Configure a default issue repository first with `/issue configure`.",
+                ephemeral=True,
+            )
+            return
+
+        db.set_issue_settings(
+            self.guild_id,
+            settings.default_owner,
+            settings.default_repo,
+            suggestion_label=settings.suggestion_label,
+            bug_label=settings.bug_label,
+            allowed_labels=_parse_comma_labels(str(self.allowed_labels.value)),
+            default_labels=_parse_comma_labels(str(self.default_labels.value)),
+            submission_log_channel_id=settings.submission_log_channel_id,
+        )
+        await interaction.response.send_message(
+            "Issue label settings updated. Use `/github dashboard` to view the refreshed panel.",
+            ephemeral=True,
+        )
+
+
+class DashboardNavigationSelect(discord.ui.Select):
+    def __init__(self, current_section: str) -> None:
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=section,
+                default=section == current_section,
+            )
+            for section, label in DASHBOARD_SECTIONS.items()
+        ]
+        super().__init__(
+            placeholder="Choose dashboard section",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _edit_dashboard(interaction, self.values[0])
+
+
+class DashboardReviewModeSelect(discord.ui.Select):
+    def __init__(self, current_mode: str) -> None:
+        options = [
+            discord.SelectOption(
+                label="Anyone",
+                value=REVIEW_MODE_ANYONE,
+                default=current_mode == REVIEW_MODE_ANYONE,
+            ),
+            discord.SelectOption(
+                label="GitHub Reviewers Only",
+                value=REVIEW_MODE_GITHUB_REVIEWERS,
+                default=current_mode == REVIEW_MODE_GITHUB_REVIEWERS,
+            ),
+            discord.SelectOption(
+                label="Discord Role Restricted",
+                value=REVIEW_MODE_DISCORD_ROLE,
+                default=current_mode == REVIEW_MODE_DISCORD_ROLE,
+            ),
+        ]
+        super().__init__(
+            placeholder="Set PR review mode",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        current = db.get_pr_review_settings(guild_id)
+        review_mode = self.values[0]
+        if review_mode == REVIEW_MODE_DISCORD_ROLE and current.discord_role_id is None:
+            await interaction.response.send_message(
+                "Use `/github set_review_mode discord_role role:@role` to choose the role first.",
+                ephemeral=True,
+            )
+            return
+
+        db.set_pr_review_settings(guild_id, review_mode, current.discord_role_id)
+        await _edit_dashboard(interaction, "pr_reviews")
+
+
+class DashboardRepositorySelect(discord.ui.Select):
+    def __init__(
+        self,
+        linked_repos: list[LinkedRepository],
+        selected_repo: tuple[str, str] | None,
+    ) -> None:
+        options = []
+        for linked_repo in linked_repos[:25]:
+            value = f"{linked_repo.owner}/{linked_repo.repo}"
+            options.append(
+                discord.SelectOption(
+                    label=value,
+                    value=value,
+                    default=selected_repo == (linked_repo.owner, linked_repo.repo),
+                )
+            )
+        super().__init__(
+            placeholder="Choose linked repository",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await _edit_dashboard(interaction, "webhook", _parse_repo_value(self.values[0]))
+
+
+class DashboardIssueToggleButton(discord.ui.Button):
+    def __init__(self, enabled: bool) -> None:
+        super().__init__(
+            label="Disable Issues" if enabled else "Enable Issues",
+            style=discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success,
+            row=1,
+        )
+        self.enabled = enabled
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        db.set_issue_creation_enabled(guild_id, not self.enabled)
+        await _edit_dashboard(interaction, "issues")
+
+
+class DashboardConfigureLabelsButton(discord.ui.Button):
     def __init__(self) -> None:
+        super().__init__(
+            label="Configure Labels",
+            style=discord.ButtonStyle.primary,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        await interaction.response.send_modal(IssueLabelsModal(guild_id, db.get_issue_settings(guild_id)))
+
+
+class DashboardRevealSecretButton(discord.ui.Button):
+    def __init__(self, selected_repo: tuple[str, str] | None) -> None:
+        super().__init__(
+            label="Reveal Secret",
+            style=discord.ButtonStyle.danger,
+            row=2,
+            disabled=selected_repo is None,
+        )
+        self.selected_repo = selected_repo
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+        if self.selected_repo is None:
+            await interaction.response.send_message(
+                "Select a linked repository before revealing its webhook secret.",
+                ephemeral=True,
+            )
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        owner, repo = self.selected_repo
+        linked_repo = db.get_linked_repository(guild_id, owner, repo)
+        if linked_repo is None:
+            await interaction.response.send_message(
+                "That repository is not linked to this server.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            (
+                f"Warning: this is the webhook secret for `{linked_repo.owner}/{linked_repo.repo}`. "
+                "Only paste it into GitHub webhook settings.\n\n"
+                f"`{linked_repo.webhook_secret}`"
+            ),
+            ephemeral=True,
+        )
+
+
+class GitHubDashboardView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        section: str,
+        *,
+        linked_repos: list[LinkedRepository] | None = None,
+        selected_repo: tuple[str, str] | None = None,
+        pr_review_mode: str = REVIEW_MODE_ANYONE,
+        issue_enabled: bool = False,
+    ) -> None:
         super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.section = section
+        self.selected_repo = selected_repo
+        linked_repos = linked_repos or []
+        self.add_item(DashboardNavigationSelect(section))
 
-    @discord.ui.button(label="Setup", style=discord.ButtonStyle.primary, row=0)
-    async def setup_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await _send_dashboard_section(interaction, "Setup")
-
-    @discord.ui.button(label="Repository settings", style=discord.ButtonStyle.secondary, row=0)
-    async def repository_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await _send_dashboard_section(interaction, "Repository settings")
-
-    @discord.ui.button(label="Log channels", style=discord.ButtonStyle.secondary, row=0)
-    async def logs_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await _send_dashboard_section(interaction, "Log channels")
-
-    @discord.ui.button(label="PR review settings", style=discord.ButtonStyle.secondary, row=0)
-    async def pr_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await _send_dashboard_section(interaction, "PR review settings")
-
-    @discord.ui.button(label="Issue creation settings", style=discord.ButtonStyle.secondary, row=1)
-    async def issues_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await _send_dashboard_section(interaction, "Issue creation settings")
-
-    @discord.ui.button(label="Webhook/App info", style=discord.ButtonStyle.secondary, row=1)
-    async def app_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await _send_dashboard_section(interaction, "Webhook/App info")
-
-    @discord.ui.button(label="Status", style=discord.ButtonStyle.secondary, row=1)
-    async def status_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await _send_dashboard_section(interaction, "Status")
+        if section == "pr_reviews":
+            self.add_item(DashboardReviewModeSelect(pr_review_mode))
+        if section == "issues":
+            self.add_item(DashboardIssueToggleButton(issue_enabled))
+            self.add_item(DashboardConfigureLabelsButton())
+        if section == "webhook":
+            if linked_repos:
+                self.add_item(DashboardRepositorySelect(linked_repos, selected_repo))
+            self.add_item(DashboardRevealSecretButton(selected_repo))
 
 
 class PullRequestReviewView(discord.ui.View):
@@ -276,6 +499,18 @@ async def _ensure_manage_guild(interaction: discord.Interaction) -> bool:
         )
         return False
     return True
+
+
+async def _ensure_dashboard_access(interaction: discord.Interaction) -> bool:
+    permissions = interaction.permissions
+    if permissions.administrator or permissions.manage_guild:
+        return True
+
+    if interaction.response.is_done():
+        await interaction.followup.send(DASHBOARD_ACCESS_MESSAGE, ephemeral=True)
+    else:
+        await interaction.response.send_message(DASHBOARD_ACCESS_MESSAGE, ephemeral=True)
+    return False
 
 
 @github_group.command(name="setup", description="Initialize Nano GitHub for this server.")
@@ -602,26 +837,12 @@ async def dashboard(interaction: discord.Interaction) -> None:
     if guild_id is None:
         await interaction.response.send_message("Run this command in a server.", ephemeral=True)
         return
-    if not await _ensure_manage_guild(interaction):
+    if not await _ensure_dashboard_access(interaction):
         return
 
-    embed = discord.Embed(
-        title="Nano GitHub Dashboard",
-        description="Choose a configuration area below.",
-        color=embeds.NANO_BLUE,
-    )
-    embed.add_field(name="Setup", value="Initialize the bot and link repositories.", inline=False)
-    embed.add_field(name="Logs", value="Configure event channels and review cards.", inline=False)
-    embed.add_field(
-        name="Issues",
-        value="Configure Discord issue creation labels and defaults.",
-        inline=False,
-    )
-    await interaction.response.send_message(
-        embed=embed,
-        view=GitHubDashboardView(),
-        ephemeral=True,
-    )
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    embed, view = await _build_dashboard(interaction, "overview")
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 @github_group.command(name="unlink_repo", description="Unlink all GitHub repositories from this server.")
@@ -1129,8 +1350,13 @@ async def _update_pr_review_activity(
         if field.name == "Latest Review Activity":
             embed.remove_field(index)
             break
+    for index, field in enumerate(embed.fields):
+        if field.name == "Review state":
+            embed.remove_field(index)
+            break
 
     timestamp = int(datetime.now(timezone.utc).timestamp())
+    embed.color = discord.Color(_review_activity_color(event))
     value_lines = [
         f"Action: {_review_activity_label(event)}",
         f"Discord user: {_display_name(interaction.user)}",
@@ -1138,6 +1364,7 @@ async def _update_pr_review_activity(
     ]
     if detail:
         value_lines.insert(2, f"Note: {_short_text(detail)}")
+    embed.add_field(name="Review state", value=_review_activity_label(event), inline=True)
     embed.add_field(name="Latest Review Activity", value="\n".join(value_lines), inline=False)
 
     try:
@@ -1159,6 +1386,15 @@ def _review_activity_label(event: str) -> str:
         "COMMENT": "Commented",
     }
     return labels.get(event, event.replace("_", " ").title())
+
+
+def _review_activity_color(event: str) -> int:
+    colors = {
+        "APPROVE": embeds.NANO_RED,
+        "REQUEST_CHANGES": embeds.NANO_GOLD,
+        "COMMENT": embeds.NANO_BLUE,
+    }
+    return colors.get(event, embeds.NANO_DARK_BLUE)
 
 
 def _short_text(value: str, limit: int = 180) -> str:
@@ -1364,52 +1600,356 @@ async def _send_issue_submission_log(
         LOGGER.exception("Failed to send issue submission log to channel %s", log_channel_id)
 
 
-async def _send_dashboard_section(interaction: discord.Interaction, section: str) -> None:
-    if not await _ensure_manage_guild(interaction):
+async def _edit_dashboard(
+    interaction: discord.Interaction,
+    section: str,
+    selected_repo: tuple[str, str] | None = None,
+) -> None:
+    if not await _ensure_dashboard_access(interaction):
         return
+    await interaction.response.defer()
+    embed, view = await _build_dashboard(interaction, section, selected_repo)
+    await interaction.edit_original_response(embed=embed, view=view)
 
-    embed = discord.Embed(title=f"Nano GitHub: {section}", color=embeds.NANO_BLUE)
-    commands_by_section = {
-        "Setup": [
-            "/github setup",
-            "/github link_repo owner repo",
-            "/github dashboard",
-        ],
-        "Repository settings": [
-            "/github link_repo owner repo",
-            "/github unlink_repo",
-            "/github status",
-        ],
-        "Log channels": [
-            "/github set_log_channel commits #channel",
-            "/github set_log_channel issues #channel",
-            "/github set_log_channel comments #channel",
-            "/github set_log_channel releases #channel",
-        ],
-        "PR review settings": [
-            "/github set_pr_review_channel #channel",
-            "/github set_review_mode anyone",
-            "/github set_review_mode discord_role role:@role",
-        ],
-        "Issue creation settings": [
-            "/issue configure default_repo_owner default_repo_name",
-            "/issue status",
-            "/issue disable",
-        ],
-        "Webhook/App info": [
-            "/github webhook_info owner repo",
-            "/github rotate_secret owner repo",
-            "/github app_status owner repo",
-        ],
-        "Status": [
-            "/github status",
-            "/issue status",
-            "/github app_status owner repo",
-        ],
-    }
-    commands_list = commands_by_section.get(section, ["/github status"])
-    embed.description = "\n".join(f"`{command}`" for command in commands_list)
-    await interaction.response.edit_message(embed=embed, view=GitHubDashboardView())
+
+async def _build_dashboard(
+    interaction: discord.Interaction,
+    section: str,
+    selected_repo: tuple[str, str] | None = None,
+) -> tuple[discord.Embed, GitHubDashboardView]:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        raise RuntimeError("Dashboard requires a guild interaction")
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    config = db.get_status(guild_id)
+    linked_repos = db.list_linked_repositories_for_guild(guild_id)
+    issue_settings = db.get_issue_settings(guild_id)
+    pr_review_mode = str(config["pr_review_mode"])
+    pr_review_role_id = config["pr_review_role_id"]
+    issue_enabled = bool(issue_settings.enabled) if issue_settings else False
+
+    if selected_repo and not db.get_linked_repository(guild_id, *selected_repo):
+        selected_repo = None
+    if selected_repo is None and linked_repos:
+        selected_repo = (linked_repos[0].owner, linked_repos[0].repo)
+
+    app_statuses: dict[tuple[str, str], str] = {}
+    if section in {"overview", "github_app"}:
+        app_statuses = await _github_app_statuses(linked_repos)
+
+    embed = _dashboard_embed(
+        section=section,
+        config=config,
+        linked_repos=linked_repos,
+        issue_settings=issue_settings,
+        pr_review_mode=pr_review_mode,
+        pr_review_role_id=pr_review_role_id,
+        selected_repo=selected_repo,
+        app_statuses=app_statuses,
+        bot_ready=interaction.client.is_ready(),
+    )
+    view = GitHubDashboardView(
+        guild_id,
+        section,
+        linked_repos=linked_repos,
+        selected_repo=selected_repo,
+        pr_review_mode=pr_review_mode,
+        issue_enabled=issue_enabled,
+    )
+    return embed, view
+
+
+def _dashboard_embed(
+    *,
+    section: str,
+    config: dict[str, object],
+    linked_repos: list[LinkedRepository],
+    issue_settings: IssueSettings | None,
+    pr_review_mode: str,
+    pr_review_role_id: int | None,
+    selected_repo: tuple[str, str] | None,
+    app_statuses: dict[tuple[str, str], str],
+    bot_ready: bool,
+) -> discord.Embed:
+    title = f"Nano GitHub Dashboard - {DASHBOARD_SECTIONS.get(section, 'Overview')}"
+    embed = discord.Embed(title=title, color=embeds.NANO_BLUE)
+    embed.set_footer(text="Admin control panel | Legacy commands remain as shortcuts")
+
+    log_channels = config["log_channels"]
+    pr_channel = config["pr_review_channel"]
+    if not isinstance(log_channels, dict):
+        log_channels = {}
+
+    if section == "overview":
+        embed.description = "Live server configuration and GitHub integration summary."
+        embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
+        embed.add_field(name="Log channels", value=_log_channel_list(log_channels), inline=False)
+        embed.add_field(
+            name="PR reviews",
+            value=(
+                f"Channel: {_channel_display(pr_channel)}\n"
+                f"Mode: {_review_mode_label(pr_review_mode, pr_review_role_id)}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Issue creation",
+            value=_issue_dashboard_summary(issue_settings),
+            inline=False,
+        )
+        embed.add_field(
+            name="GitHub App readiness",
+            value=_app_status_list(app_statuses, linked_repos),
+            inline=False,
+        )
+        embed.add_field(name="Webhook", value=_webhook_dashboard_summary(linked_repos), inline=False)
+        embed.add_field(name="Bot/API", value=_bot_api_summary(bot_ready), inline=False)
+        return embed
+
+    if section == "repositories":
+        embed.description = "Linked repositories are scoped to this Discord server."
+        embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
+        embed.add_field(
+            name="Edit",
+            value="Use `/github link_repo owner repo` or `/github unlink_repo` for repository changes.",
+            inline=False,
+        )
+        return embed
+
+    if section == "logs":
+        embed.description = "Read-only GitHub event logging channels."
+        embed.add_field(name="Configured log channels", value=_log_channel_list(log_channels), inline=False)
+        embed.add_field(
+            name="Edit",
+            value="Use `/github set_log_channel event_type channel` to change log channels.",
+            inline=False,
+        )
+        return embed
+
+    if section == "pr_reviews":
+        embed.description = "Interactive pull request review cards and button permissions."
+        embed.add_field(name="Review channel", value=_channel_display(pr_channel), inline=True)
+        embed.add_field(
+            name="Review mode",
+            value=_review_mode_label(pr_review_mode, pr_review_role_id),
+            inline=True,
+        )
+        embed.add_field(
+            name="Edit",
+            value=(
+                "Use the selector below to switch between Anyone and GitHub Reviewers Only. "
+                "Use `/github set_pr_review_channel channel` to change the channel. "
+                "Use `/github set_review_mode discord_role role:@role` to configure a role."
+            ),
+            inline=False,
+        )
+        return embed
+
+    if section == "issues":
+        embed.description = "Discord issue creation settings for this server."
+        embed.add_field(name="Status", value=_issue_dashboard_summary(issue_settings), inline=False)
+        embed.add_field(name="Labels", value=_issue_label_summary(issue_settings), inline=False)
+        embed.add_field(
+            name="Edit",
+            value=(
+                "Use the buttons below to enable or disable issue creation and edit labels. "
+                "Use `/issue configure` to change the default repository or submission log channel."
+            ),
+            inline=False,
+        )
+        return embed
+
+    if section == "github_app":
+        embed.description = "Live GitHub App installation and permission checks for linked repositories."
+        embed.add_field(
+            name="Repository readiness",
+            value=_app_status_list(app_statuses, linked_repos),
+            inline=False,
+        )
+        embed.add_field(
+            name="Required permissions",
+            value="Metadata: read | Issues: write | Pull requests: write",
+            inline=False,
+        )
+        return embed
+
+    if section == "webhook":
+        embed.description = "Safe webhook setup details. Secrets are hidden unless revealed per repository."
+        embed.add_field(name="Payload URL", value=f"`{WEBHOOK_PAYLOAD_URL}`", inline=False)
+        embed.add_field(name="Content type", value="`application/json`", inline=True)
+        embed.add_field(name="Events", value=WEBHOOK_EVENTS, inline=False)
+        embed.add_field(
+            name="Webhook secrets",
+            value=_webhook_secret_list(linked_repos, selected_repo),
+            inline=False,
+        )
+        embed.add_field(
+            name="Reveal",
+            value="Select a repository, then use Reveal Secret. Secrets are shown ephemerally only.",
+            inline=False,
+        )
+        return embed
+
+    embed.description = "Choose a dashboard section from the menu."
+    return embed
+
+
+async def _github_app_statuses(
+    linked_repos: list[LinkedRepository],
+) -> dict[tuple[str, str], str]:
+    if not linked_repos:
+        return {}
+
+    async def check(linked_repo: LinkedRepository) -> tuple[tuple[str, str], str]:
+        key = (linked_repo.owner, linked_repo.repo)
+        try:
+            result = await asyncio.to_thread(
+                check_repository_permissions,
+                linked_repo.owner,
+                linked_repo.repo,
+            )
+        except GitHubAppNotConfigured:
+            return key, "GitHub App credentials are not configured"
+        except GitHubAPIError as exc:
+            return key, f"GitHub API check failed ({exc.status_code})"
+
+        if not result.installed:
+            return key, "App not installed"
+        missing = []
+        if not result.can_create_issues:
+            missing.append("issues:write")
+        if not result.can_review_pull_requests:
+            missing.append("pull_requests:write")
+        if missing:
+            return key, "Missing " + ", ".join(missing)
+        return key, "Ready"
+
+    pairs = await asyncio.gather(*(check(linked_repo) for linked_repo in linked_repos))
+    return dict(pairs)
+
+
+def _repo_list(linked_repos: list[LinkedRepository]) -> str:
+    if not linked_repos:
+        return "None linked. Use `/github link_repo owner repo`."
+    return _dashboard_value("\n".join(f"`{repo.owner}/{repo.repo}`" for repo in linked_repos))
+
+
+def _log_channel_list(log_channels: dict[object, object]) -> str:
+    if not log_channels:
+        return "None configured. Use `/github set_log_channel`."
+    lines = [
+        f"`{event}`: <#{channel_id}>"
+        for event, channel_id in sorted(log_channels.items(), key=lambda item: str(item[0]))
+    ]
+    return _dashboard_value("\n".join(lines))
+
+
+def _channel_display(channel_id: object) -> str:
+    return f"<#{channel_id}>" if channel_id else "Not configured"
+
+
+def _issue_dashboard_summary(settings: IssueSettings | None) -> str:
+    if settings is None:
+        return "Not configured. Use `/issue configure`."
+    default_repo = (
+        f"`{settings.default_owner}/{settings.default_repo}`"
+        if settings.default_owner and settings.default_repo
+        else "Not configured"
+    )
+    log_channel = (
+        f"<#{settings.submission_log_channel_id}>"
+        if settings.submission_log_channel_id
+        else "Not configured"
+    )
+    return _dashboard_value(
+        "\n".join(
+            [
+                f"Enabled: {'Yes' if settings.enabled else 'No'}",
+                f"Default repository: {default_repo}",
+                f"Submission log: {log_channel}",
+            ]
+        )
+    )
+
+
+def _issue_label_summary(settings: IssueSettings | None) -> str:
+    if settings is None:
+        return "Allowed labels: Any\nDefault labels: None\nQuick labels: suggestion, bug"
+    return _dashboard_value(
+        "\n".join(
+            [
+                "Allowed labels: "
+                + (_label_list_display(settings.allowed_labels) if settings.allowed_labels else "Any"),
+                f"Default labels: {_label_list_display(settings.default_labels)}",
+                f"Suggestion quick label: `{settings.suggestion_label}`",
+                f"Bug quick label: `{settings.bug_label}`",
+            ]
+        )
+    )
+
+
+def _app_status_list(
+    app_statuses: dict[tuple[str, str], str],
+    linked_repos: list[LinkedRepository],
+) -> str:
+    if not linked_repos:
+        return "No linked repositories to check."
+    lines = []
+    for linked_repo in linked_repos:
+        status = app_statuses.get((linked_repo.owner, linked_repo.repo), "Not checked")
+        lines.append(f"`{linked_repo.owner}/{linked_repo.repo}`: {status}")
+    return _dashboard_value("\n".join(lines))
+
+
+def _webhook_dashboard_summary(linked_repos: list[LinkedRepository]) -> str:
+    secret_count = sum(1 for repo in linked_repos if repo.webhook_secret)
+    return _dashboard_value(
+        "\n".join(
+            [
+                f"Payload URL: `{WEBHOOK_PAYLOAD_URL}`",
+                "Content type: `application/json`",
+                f"Secret status: {secret_count}/{len(linked_repos)} linked repos have a secret",
+            ]
+        )
+    )
+
+
+def _webhook_secret_list(
+    linked_repos: list[LinkedRepository],
+    selected_repo: tuple[str, str] | None,
+) -> str:
+    if not linked_repos:
+        return "No linked repositories."
+    lines = []
+    for linked_repo in linked_repos:
+        selected = " selected" if selected_repo == (linked_repo.owner, linked_repo.repo) else ""
+        status = "exists" if linked_repo.webhook_secret else "missing"
+        lines.append(f"`{linked_repo.owner}/{linked_repo.repo}`: secret {status}{selected}")
+    return _dashboard_value("\n".join(lines))
+
+
+def _bot_api_summary(bot_ready: bool) -> str:
+    bot_state = "Connected" if bot_ready else "Starting"
+    return f"Discord bot: {bot_state}\nAPI: webhook route configured at `/webhooks/github`"
+
+
+def _dashboard_value(value: str, limit: int = 1024) -> str:
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    return f"{value[: limit - 3].rstrip()}..."
+
+
+def _parse_repo_value(value: str) -> tuple[str, str] | None:
+    if "/" not in value:
+        return None
+    owner, repo = value.split("/", 1)
+    owner = owner.strip().lower()
+    repo = repo.strip().lower()
+    if not owner or not repo:
+        return None
+    return owner, repo
 
 
 async def _resolve_text_channel(

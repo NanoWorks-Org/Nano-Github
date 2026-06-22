@@ -729,6 +729,29 @@ class Database:
             raise RuntimeError("Failed to disable issue creation")
         return settings
 
+    def set_issue_creation_enabled(self, guild_id: int, enabled: bool) -> IssueSettings:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO issue_settings (
+                    guild_id,
+                    suggestion_label,
+                    bug_label,
+                    enabled
+                )
+                VALUES (?, 'suggestion', 'bug', ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (guild_id, 1 if enabled else 0),
+            )
+
+        settings = self.get_issue_settings(guild_id)
+        if settings is None:
+            raise RuntimeError("Failed to update issue creation status")
+        return settings
+
     def record_issue_submission(
         self,
         guild_id: int,

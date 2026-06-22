@@ -115,15 +115,17 @@ Then configure Nano GitHub in Discord:
 ```text
 /github setup
 /github link_repo owner repo
+/github dashboard
 /github set_log_channel commits #github-commits
 /github set_log_channel issues #github-issues
 /github set_log_channel comments #github-comments
 /github set_log_channel releases #github-releases
 /github set_pr_review_channel #pull-request-review
 /github set_review_mode anyone
-/github dashboard
 /github status
 ```
+
+`/github dashboard` is the preferred admin control panel. The other setup commands remain as backwards-compatible shortcuts and for settings that still need Discord channel or repository command inputs.
 
 Use:
 
@@ -132,6 +134,26 @@ Use:
 ```
 
 to remove linked repositories for the server.
+
+## Admin Dashboard
+
+Use `/github dashboard` to open an ephemeral Nano GitHub admin control panel. The dashboard requires Administrator or Manage Server permission. If a normal user opens it, Nano GitHub replies ephemerally with:
+
+```text
+You need Administrator or Manage Server permission to use the Nano GitHub dashboard.
+```
+
+Dashboard sections:
+
+- **Overview** shows linked repositories, log channels, PR review channel and mode, issue creation status, label settings, GitHub App readiness, webhook setup, and bot/API status.
+- **Repositories** lists linked repositories and points admins to the repository link/unlink shortcuts.
+- **Log Channels** shows configured event log channels and the command to change them.
+- **PR Reviews** shows the PR review channel and mode, and includes an interactive selector for basic PR review mode changes.
+- **Issue Creation** shows enabled/disabled state, default repository, submission log, allowed labels, default labels, and buttons to enable/disable issue creation or edit labels.
+- **GitHub App** checks linked repositories for installation and required Issues/Pull requests write permissions.
+- **Webhook Info** shows the payload URL, content type, event list, and whether each linked repository has a webhook secret. Secrets are not shown by default; selecting a repository and using Reveal Secret shows only that server/repository secret ephemerally with a warning.
+
+The legacy commands `/github status`, `/github webhook_info`, `/github app_status`, and `/issue status` remain available as shortcuts, but the dashboard includes the same information in one place.
 
 ## Discord Issue Creation
 
@@ -220,6 +242,8 @@ The button behavior is:
 
 After Approve, Request Changes, or Comment succeeds on GitHub, Nano GitHub edits the original PR review card and adds or updates a `Latest Review Activity` field with the action, Discord username, short reason or comment when provided, and timestamp. The View Pull Request button remains on updated cards, and the review buttons use persistent custom IDs so they continue working after bot restarts.
 
+Approved PR review activity is shown with the configured user-preferred red embed color. Requested changes use a warning color, and comments use the standard Nano blue.
+
 Review actions use a repository installation token for the linked repository. The GitHub App must have `Pull requests: Read and write` permission. If the permission is missing, Nano GitHub replies with a friendly Discord error such as:
 
 ```text
@@ -234,7 +258,7 @@ PR review actions are configured per Discord server:
 
 Use `/github app_status owner repo` to verify repository installation, installation token generation, issue creation permission, and pull request review permission.
 
-Use `/github dashboard` to open an ephemeral command dashboard with buttons for setup, repository settings, log channels, PR review settings, issue creation settings, webhook/app info, and status. Dashboard actions and all setup/configuration/status commands are admin-only. Normal users can run `/issue create` when issue creation is enabled.
+Use `/github dashboard` for the main admin panel. Dashboard actions and all setup/configuration/status commands are admin-only, with the dashboard accepting Administrator or Manage Server. Normal users can run `/issue create` when issue creation is enabled.
 
 Required GitHub App repository permissions:
 
