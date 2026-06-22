@@ -272,6 +272,66 @@ def pull_request_embed(payload: dict[str, Any]) -> discord.Embed:
     return embed
 
 
+def issue_submission_success_embed(
+    *,
+    issue_title: str,
+    issue_number: int,
+    issue_type: str,
+    repository: str,
+    submitted_by: str,
+    issue_url: str,
+    labels_applied: bool,
+    label_error: str | None = None,
+) -> discord.Embed:
+    color = NANO_GREEN if labels_applied else NANO_GOLD
+    embed = discord.Embed(
+        title=_truncate(issue_title, 256),
+        url=issue_url,
+        color=color,
+    )
+    embed.add_field(name="Issue", value=f"#{issue_number}", inline=True)
+    embed.add_field(name="Type", value=issue_type, inline=True)
+    embed.add_field(name="Repository", value=f"`{repository}`", inline=True)
+    embed.add_field(name="Submitted by", value=submitted_by, inline=True)
+    embed.add_field(name="GitHub issue", value=f"[Open issue]({issue_url})", inline=False)
+    if not labels_applied:
+        embed.add_field(
+            name="Labels",
+            value=(
+                f"Issue created, but labels could not be applied. {label_error}"
+                if label_error
+                else "Issue created, but labels could not be applied."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="Nano GitHub issue submission")
+    return embed
+
+
+def issue_submission_log_embed(
+    *,
+    issue_title: str,
+    issue_number: int,
+    issue_type: str,
+    repository: str,
+    submitted_by: str,
+    channel_id: int,
+    issue_url: str,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=_truncate(f"Discord issue submitted: {issue_title}", 256),
+        url=issue_url,
+        color=NANO_DARK_BLUE,
+    )
+    embed.add_field(name="Issue", value=f"#{issue_number}", inline=True)
+    embed.add_field(name="Type", value=issue_type, inline=True)
+    embed.add_field(name="Repository", value=f"`{repository}`", inline=True)
+    embed.add_field(name="Submitted by", value=submitted_by, inline=True)
+    embed.add_field(name="Channel", value=f"<#{channel_id}>", inline=True)
+    embed.add_field(name="GitHub issue", value=f"[Open issue]({issue_url})", inline=False)
+    return embed
+
+
 def _pr_color(action: str, state: str, draft: bool) -> int:
     if state == "merged":
         return NANO_BLUE

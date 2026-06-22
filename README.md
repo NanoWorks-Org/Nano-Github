@@ -6,12 +6,14 @@ It deliberately separates read-only logging from pull request review:
 
 - **Logging channels** receive normal GitHub event embeds for commits, issues, issue comments, and releases.
 - **Pull request review channels** receive interactive PR review cards with buttons. The MVP buttons do not fake reviews; they reply ephemerally that GitHub App review/comment permissions are not configured yet.
+- **Discord issue creation** lets server members create GitHub suggestions and bug reports through the Nano GitHub GitHub App without needing GitHub accounts.
 
 ## Features
 
 - Python, `discord.py`, FastAPI, and SQLite
 - Slash-command setup per Discord server
 - Per-server linked repository configuration
+- Per-server GitHub issue creation settings
 - GitHub webhook endpoint at `POST /webhooks/github`
 - HMAC SHA-256 verification for GitHub webhook secrets
 - Events supported now:
@@ -43,10 +45,14 @@ Required variables:
 ```env
 DISCORD_TOKEN=replace-with-your-discord-bot-token
 GITHUB_WEBHOOK_SECRET=replace-with-a-long-random-secret
+GITHUB_APP_ID=replace-with-your-github-app-id
+GITHUB_APP_PRIVATE_KEY_PATH=/path/to/github-app-private-key.pem
 API_HOST=0.0.0.0
 API_PORT=8080
 DATABASE_PATH=data/nano_github.sqlite3
 ```
+
+`GITHUB_APP_PRIVATE_KEY` is also supported. If you store it in an environment variable, replace newlines with `\n`.
 
 `DATABASE_URL` is also supported for SQLite, for example:
 
@@ -124,6 +130,38 @@ Use:
 ```
 
 to remove linked repositories for the server.
+
+## Discord Issue Creation
+
+Issue creation is configured per Discord server and always checks that the selected GitHub repository is linked to that same server.
+
+Server owners or members with Manage Server can configure it:
+
+```text
+/issue configure default_repo_owner default_repo_name suggestion bug #issue-submissions
+/issue status
+/issue disable
+```
+
+Normal server members can create issues unless issue creation has been disabled:
+
+```text
+/issue create type:suggestion title:"Add dark mode" description:"Please add a dark theme."
+/issue create type:bug title:"Sync failed" description:"The webhook did not post." owner:nanoworks repo:nano-github
+```
+
+Repository selection works like this:
+
+- If `owner` and `repo` are provided, that repository must already be linked to the Discord server.
+- If no repository is provided and a default repository is configured, Nano GitHub uses the default.
+- If no default is configured and the server has exactly one linked repository, Nano GitHub uses it automatically.
+- If multiple repositories are linked and no default or explicit repository is available, Nano GitHub asks the user to specify `owner` and `repo`.
+
+Suggestions receive the configured suggestion label, defaulting to `suggestion`. Bugs receive the configured bug label, defaulting to `bug`. If GitHub rejects the labels because they do not exist, the issue is still created and the Discord reply mentions that labels could not be applied.
+
+Created GitHub issues include the submitted description plus Discord metadata: display name, Discord username, user ID, server name, server ID, channel name, and channel ID.
+
+Discord users do not need GitHub accounts. Issue creation uses the Nano GitHub GitHub App installation token for the selected repository. The GitHub App must be installed on that repository and have permission to create issues.
 
 ## GitHub Webhook Setup
 

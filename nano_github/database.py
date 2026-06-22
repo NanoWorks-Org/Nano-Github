@@ -31,6 +31,32 @@ class PrMessage:
     state: str
 
 
+@dataclass(frozen=True)
+class IssueSettings:
+    guild_id: int
+    default_owner: str | None
+    default_repo: str | None
+    suggestion_label: str
+    bug_label: str
+    submission_log_channel_id: int | None
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class IssueSubmission:
+    id: int
+    guild_id: int
+    channel_id: int
+    user_id: int
+    owner: str
+    repo: str
+    issue_number: int
+    issue_url: str
+    issue_type: str
+    title: str
+    created_at: str
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -111,6 +137,45 @@ class Database:
                     PRIMARY KEY (guild_id, owner, repo, pr_number),
                     FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS issue_settings (
+                    guild_id INTEGER PRIMARY KEY,
+                    default_owner TEXT,
+                    default_repo TEXT,
+                    suggestion_label TEXT NOT NULL DEFAULT 'suggestion',
+                    bug_label TEXT NOT NULL DEFAULT 'bug',
+                    submission_log_channel_id INTEGER,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS issue_submissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    owner TEXT NOT NULL,
+                    repo TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    issue_url TEXT NOT NULL,
+                    issue_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_issue_submissions_guild
+                    ON issue_submissions(guild_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS issue_role_rules (
+                    guild_id INTEGER NOT NULL,
+                    role_id INTEGER NOT NULL,
+                    rule_type TEXT NOT NULL CHECK (rule_type IN ('allow', 'deny')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, role_id, rule_type),
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
                 """
             )
             self._ensure_webhook_secret_column()
@@ -188,6 +253,19 @@ class Database:
             ).fetchone()
 
         return _linked_repository_from_row(row) if row else None
+
+    def list_linked_repositories_for_guild(self, guild_id: int) -> list[LinkedRepository]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, owner, repo, webhook_secret
+                FROM linked_repositories
+                WHERE guild_id = ?
+                ORDER BY owner, repo
+                """,
+                (guild_id,),
+            ).fetchall()
+        return [_linked_repository_from_row(row) for row in rows]
 
     def rotate_webhook_secret(
         self,
@@ -418,6 +496,162 @@ class Database:
                 (guild_id, owner, repo, pr_number, channel_id, message_id, state),
             )
 
+    def set_issue_settings(
+        self,
+        guild_id: int,
+        default_owner: str,
+        default_repo: str,
+        suggestion_label: str = "suggestion",
+        bug_label: str = "bug",
+        submission_log_channel_id: int | None = None,
+    ) -> IssueSettings:
+        default_owner, default_repo = _normalize_repo(default_owner, default_repo)
+        suggestion_label = _normalize_label(suggestion_label, "suggestion")
+        bug_label = _normalize_label(bug_label, "bug")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO issue_settings (
+                    guild_id,
+                    default_owner,
+                    default_repo,
+                    suggestion_label,
+                    bug_label,
+                    submission_log_channel_id,
+                    enabled
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    default_owner = excluded.default_owner,
+                    default_repo = excluded.default_repo,
+                    suggestion_label = excluded.suggestion_label,
+                    bug_label = excluded.bug_label,
+                    submission_log_channel_id = excluded.submission_log_channel_id,
+                    enabled = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    guild_id,
+                    default_owner,
+                    default_repo,
+                    suggestion_label,
+                    bug_label,
+                    submission_log_channel_id,
+                ),
+            )
+
+        settings = self.get_issue_settings(guild_id)
+        if settings is None:
+            raise RuntimeError("Failed to save issue settings")
+        return settings
+
+    def get_issue_settings(self, guild_id: int) -> IssueSettings | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT
+                    guild_id,
+                    default_owner,
+                    default_repo,
+                    suggestion_label,
+                    bug_label,
+                    submission_log_channel_id,
+                    enabled
+                FROM issue_settings
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+        return _issue_settings_from_row(row) if row else None
+
+    def disable_issue_creation(self, guild_id: int) -> IssueSettings:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO issue_settings (
+                    guild_id,
+                    suggestion_label,
+                    bug_label,
+                    enabled
+                )
+                VALUES (?, 'suggestion', 'bug', 0)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    enabled = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (guild_id,),
+            )
+
+        settings = self.get_issue_settings(guild_id)
+        if settings is None:
+            raise RuntimeError("Failed to disable issue creation")
+        return settings
+
+    def record_issue_submission(
+        self,
+        guild_id: int,
+        channel_id: int,
+        user_id: int,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        issue_url: str,
+        issue_type: str,
+        title: str,
+    ) -> IssueSubmission:
+        owner, repo = _normalize_repo(owner, repo)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO issue_submissions (
+                    guild_id,
+                    channel_id,
+                    user_id,
+                    owner,
+                    repo,
+                    issue_number,
+                    issue_url,
+                    issue_type,
+                    title
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    channel_id,
+                    user_id,
+                    owner,
+                    repo,
+                    issue_number,
+                    issue_url,
+                    issue_type,
+                    title,
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT
+                    id,
+                    guild_id,
+                    channel_id,
+                    user_id,
+                    owner,
+                    repo,
+                    issue_number,
+                    issue_url,
+                    issue_type,
+                    title,
+                    created_at
+                FROM issue_submissions
+                WHERE id = ?
+                """,
+                (cursor.lastrowid,),
+            ).fetchone()
+
+        if row is None:
+            raise RuntimeError("Failed to record issue submission")
+        return _issue_submission_from_row(row)
+
     def _ensure_webhook_secret_column(self) -> None:
         columns = {
             row["name"]
@@ -453,6 +687,12 @@ def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:
     return owner.strip().lower(), repo.strip().lower()
 
 
+def _normalize_label(value: str | None, fallback: str) -> str:
+    if not value or not value.strip():
+        return fallback
+    return value.strip()
+
+
 def _generate_webhook_secret() -> str:
     return secrets.token_urlsafe(32)
 
@@ -463,4 +703,33 @@ def _linked_repository_from_row(row: sqlite3.Row) -> LinkedRepository:
         owner=row["owner"],
         repo=row["repo"],
         webhook_secret=row["webhook_secret"],
+    )
+
+
+def _issue_settings_from_row(row: sqlite3.Row) -> IssueSettings:
+    log_channel_id = row["submission_log_channel_id"]
+    return IssueSettings(
+        guild_id=int(row["guild_id"]),
+        default_owner=row["default_owner"],
+        default_repo=row["default_repo"],
+        suggestion_label=row["suggestion_label"],
+        bug_label=row["bug_label"],
+        submission_log_channel_id=int(log_channel_id) if log_channel_id is not None else None,
+        enabled=bool(row["enabled"]),
+    )
+
+
+def _issue_submission_from_row(row: sqlite3.Row) -> IssueSubmission:
+    return IssueSubmission(
+        id=int(row["id"]),
+        guild_id=int(row["guild_id"]),
+        channel_id=int(row["channel_id"]),
+        user_id=int(row["user_id"]),
+        owner=row["owner"],
+        repo=row["repo"],
+        issue_number=int(row["issue_number"]),
+        issue_url=row["issue_url"],
+        issue_type=row["issue_type"],
+        title=row["title"],
+        created_at=row["created_at"],
     )
