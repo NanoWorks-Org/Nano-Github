@@ -152,6 +152,10 @@ For local development, expose `localhost:8080` through a tunnel such as ngrok or
 
 Commits, issues, issue comments, and releases are notification events. They are sent as read-only embeds to the log channel configured for their event type.
 
+Issue embeds show the issue title, body preview, repository, author, state, labels, author avatar when GitHub provides one, and a View Issue link button.
+
+Push events are formatted as commit notifications. A single-commit push sends one detailed commit embed. Pushes with 2-5 commits send one embed per commit. Pushes with more than 5 commits send a summary embed plus the first 5 commit embeds. Empty pushes are ignored unless GitHub marks them as branch creation or deletion events.
+
 Pull requests are workflow events. They are not posted to normal log channels. They are sent to the configured PR review channel as interactive review cards that include:
 
 - PR title and number

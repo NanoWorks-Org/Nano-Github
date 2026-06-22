@@ -64,7 +64,10 @@ async def github_webhook(
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
         LOGGER.warning("Malformed GitHub webhook payload: %s", exc)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed JSON") from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed JSON",
+        ) from exc
 
     if not isinstance(payload, dict):
         LOGGER.warning("Malformed GitHub webhook payload: JSON root is not an object")
@@ -109,7 +112,17 @@ async def github_webhook(
         LOGGER.info("Ignoring unsupported GitHub event %s", event)
         return {"ignored": True, "reason": "unsupported event"}
 
-    await _dispatch_log_event(bot, db, guild_ids, log_event_type, payload)
+    messages = _log_messages(log_event_type, payload)
+    if not messages:
+        LOGGER.info(
+            "Ignoring %s event for %s/%s because it has no dispatchable messages",
+            event,
+            owner,
+            repo,
+        )
+        return {"ignored": True, "reason": "no dispatchable messages"}
+
+    await _dispatch_log_event(bot, db, guild_ids, log_event_type, messages)
     return {"accepted": True, "event": event, "guilds": len(guild_ids)}
 
 
@@ -168,9 +181,8 @@ async def _dispatch_log_event(
     db: Database,
     guild_ids: list[int],
     event_type: str,
-    payload: dict[str, Any],
+    messages: list[embeds.EmbedMessage],
 ) -> None:
-    embed = _log_embed(event_type, payload)
     for guild_id in guild_ids:
         channel_id = db.get_log_channel(guild_id, event_type)
         if channel_id is None:
@@ -183,13 +195,22 @@ async def _dispatch_log_event(
 
         channel = await _resolve_text_channel(bot, channel_id)
         if channel is None:
-            LOGGER.warning("Configured log channel %s is unavailable for guild %s", channel_id, guild_id)
+            LOGGER.warning(
+                "Configured log channel %s is unavailable for guild %s",
+                channel_id,
+                guild_id,
+            )
             continue
 
         try:
-            await channel.send(embed=embed)
+            for message in messages:
+                await channel.send(embed=message.embed, view=message.view)
         except discord.Forbidden:
-            LOGGER.warning("Missing permission to send %s event to channel %s", event_type, channel_id)
+            LOGGER.warning(
+                "Missing permission to send %s event to channel %s",
+                event_type,
+                channel_id,
+            )
         except discord.HTTPException:
             LOGGER.exception("Failed to send %s event to channel %s", event_type, channel_id)
 
@@ -216,7 +237,8 @@ async def _dispatch_pull_request(
         channel_id = db.get_pr_review_channel(guild_id)
         if channel_id is None:
             LOGGER.warning(
-                "Skipping pull request event for guild %s because no PR review channel is configured",
+                "Skipping pull request event for guild %s because no PR review channel "
+                "is configured",
                 guild_id,
             )
             continue
@@ -236,7 +258,15 @@ async def _dispatch_pull_request(
             try:
                 message = await channel.fetch_message(existing.message_id)
                 await message.edit(embed=embed, view=view)
-                db.upsert_pr_message(guild_id, owner, repo, pr_number, channel_id, message.id, state)
+                db.upsert_pr_message(
+                    guild_id,
+                    owner,
+                    repo,
+                    pr_number,
+                    channel_id,
+                    message.id,
+                    state,
+                )
                 continue
             except discord.NotFound:
                 LOGGER.warning(
@@ -259,15 +289,15 @@ async def _dispatch_pull_request(
             LOGGER.exception("Failed to send PR card to channel %s", channel_id)
 
 
-def _log_embed(event_type: str, payload: dict[str, Any]) -> discord.Embed:
+def _log_messages(event_type: str, payload: dict[str, Any]) -> list[embeds.EmbedMessage]:
     if event_type == "commits":
-        return embeds.push_embed(payload)
+        return embeds.push_messages(payload)
     if event_type == "issues":
-        return embeds.issue_embed(payload)
+        return [embeds.issue_message(payload)]
     if event_type == "comments":
-        return embeds.issue_comment_embed(payload)
+        return [embeds.EmbedMessage(embeds.issue_comment_embed(payload))]
     if event_type == "releases":
-        return embeds.release_embed(payload)
+        return [embeds.EmbedMessage(embeds.release_embed(payload))]
     raise ValueError(f"Unsupported log event type: {event_type}")
 
 
