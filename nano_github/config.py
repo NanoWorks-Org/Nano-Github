@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     discord_token: str
-    github_webhook_secret: str
+    github_webhook_secret: str | None = None
     api_host: str = "0.0.0.0"
     api_port: int = 8080
     database_url: str | None = None
@@ -26,4 +26,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-

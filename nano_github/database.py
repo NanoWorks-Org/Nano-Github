@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -15,7 +16,8 @@ LOGGER = logging.getLogger(__name__)
 class LinkedRepository:
     guild_id: int
     owner: str
-    name: str
+    repo: str
+    webhook_secret: str
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class Database:
                     guild_id INTEGER NOT NULL,
                     owner TEXT NOT NULL,
                     repo TEXT NOT NULL,
+                    webhook_secret TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (guild_id, owner, repo),
                     FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
@@ -110,6 +113,7 @@ class Database:
                 );
                 """
             )
+            self._ensure_webhook_secret_column()
 
     def upsert_guild(self, guild_id: int, guild_name: str | None = None) -> None:
         with self._lock, self._connection:
@@ -124,16 +128,88 @@ class Database:
                 (guild_id, guild_name),
             )
 
-    def link_repository(self, guild_id: int, owner: str, repo: str) -> None:
+    def link_repository(self, guild_id: int, owner: str, repo: str) -> LinkedRepository:
         owner, repo = _normalize_repo(owner, repo)
+        webhook_secret = _generate_webhook_secret()
         with self._lock, self._connection:
             self._connection.execute(
                 """
-                INSERT OR IGNORE INTO linked_repositories (guild_id, owner, repo)
-                VALUES (?, ?, ?)
+                INSERT OR IGNORE INTO linked_repositories (guild_id, owner, repo, webhook_secret)
+                VALUES (?, ?, ?, ?)
+                """,
+                (guild_id, owner, repo, webhook_secret),
+            )
+            row = self._connection.execute(
+                """
+                SELECT guild_id, owner, repo, webhook_secret
+                FROM linked_repositories
+                WHERE guild_id = ? AND owner = ? AND repo = ?
                 """,
                 (guild_id, owner, repo),
+            ).fetchone()
+
+            if row and not row["webhook_secret"]:
+                webhook_secret = _generate_webhook_secret()
+                self._connection.execute(
+                    """
+                    UPDATE linked_repositories
+                    SET webhook_secret = ?
+                    WHERE guild_id = ? AND owner = ? AND repo = ?
+                    """,
+                    (webhook_secret, guild_id, owner, repo),
+                )
+                return LinkedRepository(guild_id, owner, repo, webhook_secret)
+
+        if row is None:
+            raise RuntimeError("Failed to link repository")
+
+        return LinkedRepository(
+            guild_id=int(row["guild_id"]),
+            owner=row["owner"],
+            repo=row["repo"],
+            webhook_secret=row["webhook_secret"],
+        )
+
+    def get_linked_repository(
+        self,
+        guild_id: int,
+        owner: str,
+        repo: str,
+    ) -> LinkedRepository | None:
+        owner, repo = _normalize_repo(owner, repo)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT guild_id, owner, repo, webhook_secret
+                FROM linked_repositories
+                WHERE guild_id = ? AND owner = ? AND repo = ?
+                """,
+                (guild_id, owner, repo),
+            ).fetchone()
+
+        return _linked_repository_from_row(row) if row else None
+
+    def rotate_webhook_secret(
+        self,
+        guild_id: int,
+        owner: str,
+        repo: str,
+    ) -> LinkedRepository | None:
+        owner, repo = _normalize_repo(owner, repo)
+        webhook_secret = _generate_webhook_secret()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE linked_repositories
+                SET webhook_secret = ?
+                WHERE guild_id = ? AND owner = ? AND repo = ?
+                """,
+                (webhook_secret, guild_id, owner, repo),
             )
+            if cursor.rowcount == 0:
+                return None
+
+        return LinkedRepository(guild_id, owner, repo, webhook_secret)
 
     def unlink_repositories(self, guild_id: int) -> int:
         with self._lock, self._connection:
@@ -201,6 +277,19 @@ class Database:
                 (owner, repo),
             ).fetchall()
         return [int(row["guild_id"]) for row in rows]
+
+    def find_linked_repositories(self, owner: str, repo: str) -> list[LinkedRepository]:
+        owner, repo = _normalize_repo(owner, repo)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, owner, repo, webhook_secret
+                FROM linked_repositories
+                WHERE owner = ? AND repo = ?
+                """,
+                (owner, repo),
+            ).fetchall()
+        return [_linked_repository_from_row(row) for row in rows]
 
     def get_status(self, guild_id: int) -> dict[str, Any]:
         with self._lock:
@@ -329,7 +418,49 @@ class Database:
                 (guild_id, owner, repo, pr_number, channel_id, message_id, state),
             )
 
+    def _ensure_webhook_secret_column(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(linked_repositories)").fetchall()
+        }
+        if "webhook_secret" not in columns:
+            self._connection.execute("ALTER TABLE linked_repositories ADD COLUMN webhook_secret TEXT")
+
+        rows = self._connection.execute(
+            """
+            SELECT guild_id, owner, repo
+            FROM linked_repositories
+            WHERE webhook_secret IS NULL OR webhook_secret = ''
+            """
+        ).fetchall()
+        for row in rows:
+            self._connection.execute(
+                """
+                UPDATE linked_repositories
+                SET webhook_secret = ?
+                WHERE guild_id = ? AND owner = ? AND repo = ?
+                """,
+                (
+                    _generate_webhook_secret(),
+                    int(row["guild_id"]),
+                    row["owner"],
+                    row["repo"],
+                ),
+            )
+
 
 def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:
     return owner.strip().lower(), repo.strip().lower()
 
+
+def _generate_webhook_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _linked_repository_from_row(row: sqlite3.Row) -> LinkedRepository:
+    return LinkedRepository(
+        guild_id=int(row["guild_id"]),
+        owner=row["owner"],
+        repo=row["repo"],
+        webhook_secret=row["webhook_secret"],
+    )

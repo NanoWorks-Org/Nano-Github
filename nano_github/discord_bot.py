@@ -13,6 +13,8 @@ LOGGER = logging.getLogger(__name__)
 
 LOG_EVENT_TYPES = ("commits", "issues", "comments", "releases")
 LogEventType = Literal["commits", "issues", "comments", "releases"]
+WEBHOOK_PAYLOAD_URL = "https://api.nanoworks.co.uk/webhooks/github"
+WEBHOOK_EVENTS = "Pushes, Issues, Issue comments, Pull requests, Releases"
 
 
 class PullRequestReviewView(discord.ui.View):
@@ -150,9 +152,72 @@ async def link_repo(interaction: discord.Interaction, owner: str, repo: str) -> 
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
     db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
-    db.link_repository(guild_id, owner, repo)
+    linked_repo = db.link_repository(guild_id, owner, repo)
     await interaction.response.send_message(
-        f"Linked `{owner.strip().lower()}/{repo.strip().lower()}` to this server.",
+        (
+            f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server. "
+            "Use `/github webhook_info` to view the webhook secret."
+        ),
+        ephemeral=True,
+    )
+
+
+@github_group.command(name="webhook_info", description="Show webhook setup details for a linked repository.")
+@app_commands.describe(owner="GitHub repository owner or organization", repo="GitHub repository name")
+async def webhook_info(interaction: discord.Interaction, owner: str, repo: str) -> None:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        await interaction.response.send_message("Run this command in a server.", ephemeral=True)
+        return
+    if not await _ensure_manage_guild(interaction):
+        return
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    linked_repo = db.get_linked_repository(guild_id, owner, repo)
+    if linked_repo is None:
+        await interaction.response.send_message(
+            f"`{owner.strip().lower()}/{repo.strip().lower()}` is not linked to this server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        (
+            f"Webhook info for `{linked_repo.owner}/{linked_repo.repo}`\n"
+            f"Payload URL: `{WEBHOOK_PAYLOAD_URL}`\n"
+            "Content Type: `application/json`\n"
+            f"Secret: `{linked_repo.webhook_secret}`\n"
+            f"Events to select: {WEBHOOK_EVENTS}"
+        ),
+        ephemeral=True,
+    )
+
+
+@github_group.command(name="rotate_secret", description="Rotate the webhook secret for a linked repository.")
+@app_commands.describe(owner="GitHub repository owner or organization", repo="GitHub repository name")
+async def rotate_secret(interaction: discord.Interaction, owner: str, repo: str) -> None:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        await interaction.response.send_message("Run this command in a server.", ephemeral=True)
+        return
+    if not await _ensure_manage_guild(interaction):
+        return
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    linked_repo = db.rotate_webhook_secret(guild_id, owner, repo)
+    if linked_repo is None:
+        await interaction.response.send_message(
+            f"`{owner.strip().lower()}/{repo.strip().lower()}` is not linked to this server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        (
+            f"Rotated webhook secret for `{linked_repo.owner}/{linked_repo.repo}`.\n"
+            f"New secret: `{linked_repo.webhook_secret}`\n"
+            "Update the GitHub webhook secret before new deliveries will be accepted."
+        ),
         ephemeral=True,
     )
 

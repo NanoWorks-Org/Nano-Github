@@ -11,7 +11,7 @@ from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, status
 
 from nano_github import embeds
 from nano_github.config import Settings
-from nano_github.database import Database
+from nano_github.database import Database, LinkedRepository
 from nano_github.discord_bot import NanoGitHubBot, PullRequestReviewView
 
 LOGGER = logging.getLogger(__name__)
@@ -60,9 +60,6 @@ async def github_webhook(
     db: Database = request.app.state.db
     bot: NanoGitHubBot = request.app.state.bot
 
-    if not _valid_signature(body, x_hub_signature_256, settings.github_webhook_secret):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
-
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -78,16 +75,27 @@ async def github_webhook(
     repo_info = _repository_info(payload)
     owner = repo_info["owner"]
     repo = repo_info["repo"]
-    db.record_webhook_event(x_github_delivery, event, action, owner, repo, payload)
 
     if not owner or not repo:
         LOGGER.warning("Ignoring %s webhook without repository information", event)
         return {"ignored": True, "reason": "missing repository"}
 
-    guild_ids = db.find_guilds_for_repository(owner, repo)
-    if not guild_ids:
+    linked_repositories = db.find_linked_repositories(owner, repo)
+    if not linked_repositories:
         LOGGER.info("Ignoring %s for unlinked repository %s/%s", event, owner, repo)
         return {"ignored": True, "reason": "repository not linked"}
+
+    verified_repositories = _verified_repositories(
+        body,
+        x_hub_signature_256,
+        linked_repositories,
+        settings.github_webhook_secret,
+    )
+    if not verified_repositories:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
+
+    guild_ids = [linked_repo.guild_id for linked_repo in verified_repositories]
+    db.record_webhook_event(x_github_delivery, event, action, owner, repo, payload)
 
     if event == "pull_request":
         if action not in PR_ACTIONS:
@@ -105,8 +113,33 @@ async def github_webhook(
     return {"accepted": True, "event": event, "guilds": len(guild_ids)}
 
 
-def _valid_signature(body: bytes, signature: str | None, secret: str) -> bool:
-    if not signature:
+def _verified_repositories(
+    body: bytes,
+    signature: str | None,
+    linked_repositories: list[LinkedRepository],
+    fallback_secret: str | None,
+) -> list[LinkedRepository]:
+    verified = [
+        linked_repo
+        for linked_repo in linked_repositories
+        if _valid_signature(body, signature, linked_repo.webhook_secret)
+    ]
+    if verified:
+        return verified
+
+    if fallback_secret and _valid_signature(body, signature, fallback_secret):
+        LOGGER.warning(
+            "Accepted GitHub webhook for %s/%s with fallback GITHUB_WEBHOOK_SECRET",
+            linked_repositories[0].owner,
+            linked_repositories[0].repo,
+        )
+        return linked_repositories
+
+    return []
+
+
+def _valid_signature(body: bytes, signature: str | None, secret: str | None) -> bool:
+    if not signature or not secret:
         return False
 
     expected = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
@@ -254,4 +287,3 @@ async def _resolve_text_channel(
 
     LOGGER.warning("Configured channel %s is not a text channel or thread", channel_id)
     return None
-
