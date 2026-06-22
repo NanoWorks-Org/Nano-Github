@@ -209,4 +209,3 @@ Build Docker image:
 docker compose build
 ```
 
-Should work now.
