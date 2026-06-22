@@ -208,3 +208,5 @@ Build Docker image:
 ```bash
 docker compose build
 ```
+
+Is it working?
