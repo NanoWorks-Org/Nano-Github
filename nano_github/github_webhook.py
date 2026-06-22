@@ -30,6 +30,8 @@ PR_ACTIONS = {
     "reopened",
     "ready_for_review",
     "synchronize",
+    "review_requested",
+    "review_request_removed",
     "closed",
 }
 
@@ -232,6 +234,8 @@ async def _dispatch_pull_request(
     state = "merged" if pr.get("merged") else str(pr.get("state", "unknown"))
     github_url = pr.get("html_url")
     embed = embeds.pull_request_embed(payload)
+    requested_reviewers = _requested_reviewer_logins(pr)
+    requested_teams = _requested_team_slugs(pr)
 
     for guild_id in guild_ids:
         channel_id = db.get_pr_review_channel(guild_id)
@@ -266,6 +270,8 @@ async def _dispatch_pull_request(
                     channel_id,
                     message.id,
                     state,
+                    requested_reviewers,
+                    requested_teams,
                 )
                 continue
             except discord.NotFound:
@@ -282,7 +288,17 @@ async def _dispatch_pull_request(
 
         try:
             message = await channel.send(embed=embed, view=view)
-            db.upsert_pr_message(guild_id, owner, repo, pr_number, channel_id, message.id, state)
+            db.upsert_pr_message(
+                guild_id,
+                owner,
+                repo,
+                pr_number,
+                channel_id,
+                message.id,
+                state,
+                requested_reviewers,
+                requested_teams,
+            )
         except discord.Forbidden:
             LOGGER.warning("Missing permission to send PR card to channel %s", channel_id)
         except discord.HTTPException:
@@ -299,6 +315,32 @@ def _log_messages(event_type: str, payload: dict[str, Any]) -> list[embeds.Embed
     if event_type == "releases":
         return [embeds.EmbedMessage(embeds.release_embed(payload))]
     raise ValueError(f"Unsupported log event type: {event_type}")
+
+
+def _requested_reviewer_logins(pr: dict[str, Any]) -> list[str]:
+    reviewers = pr.get("requested_reviewers")
+    if not isinstance(reviewers, list):
+        return []
+    return [
+        login.strip().lower()
+        for reviewer in reviewers
+        if isinstance(reviewer, dict)
+        for login in [reviewer.get("login")]
+        if isinstance(login, str) and login.strip()
+    ]
+
+
+def _requested_team_slugs(pr: dict[str, Any]) -> list[str]:
+    teams = pr.get("requested_teams")
+    if not isinstance(teams, list):
+        return []
+    return [
+        slug.strip().lower()
+        for team in teams
+        if isinstance(team, dict)
+        for slug in [team.get("slug")]
+        if isinstance(slug, str) and slug.strip()
+    ]
 
 
 async def _resolve_text_channel(

@@ -9,12 +9,23 @@ from discord import app_commands
 from discord.ext import commands
 
 from nano_github import embeds
-from nano_github.database import Database, IssueSettings, LinkedRepository
+from nano_github.database import (
+    REVIEW_MODE_ANYONE,
+    REVIEW_MODE_DISCORD_ROLE,
+    REVIEW_MODE_GITHUB_REVIEWERS,
+    Database,
+    IssueSettings,
+    LinkedRepository,
+    PrMessage,
+)
 from nano_github.github_client import (
     GitHubAPIError,
     GitHubAppNotConfigured,
     GitHubAppNotInstalled,
+    GitHubAppMissingPermission,
+    check_repository_permissions,
     create_issue as github_create_issue,
+    submit_pull_request_review,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -25,7 +36,47 @@ WEBHOOK_PAYLOAD_URL = "https://api.nanoworks.co.uk/webhooks/github"
 WEBHOOK_EVENTS = "Pushes, Issues, Issue comments, Pull requests, Releases"
 
 
+class PullRequestCommentModal(discord.ui.Modal, title="Comment on Pull Request"):
+    review_body = discord.ui.TextInput(
+        label="Review comment",
+        style=discord.TextStyle.paragraph,
+        min_length=1,
+        max_length=3000,
+    )
+
+    def __init__(self, pr_message: PrMessage) -> None:
+        super().__init__()
+        self.pr_message = pr_message
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await _submit_pr_review(
+            interaction,
+            self.pr_message,
+            "COMMENT",
+            str(self.review_body.value),
+        )
+
+
 class PullRequestReviewView(discord.ui.View):
+    """Interactive PR review card audit.
+
+    Current state after this implementation:
+    - View Pull Request is a real Discord link button and requires no GitHub API permissions.
+    - Approve submits a GitHub Pull Request Review with event APPROVE.
+    - Request Changes submits a GitHub Pull Request Review with event REQUEST_CHANGES.
+    - Comment opens a Discord modal and submits a GitHub Pull Request Review with event COMMENT.
+
+    GitHub requirements:
+    - Repository lookup uses app JWT auth against GET /repos/{owner}/{repo}/installation.
+    - Review actions create a repository installation token and require pull_requests:write.
+    - Issue creation creates a repository installation token and requires issues:write.
+
+    Discord requirements:
+    - Configuration, repository linking, webhook, and channel commands are admin-only.
+    - PR review actions are guild-scoped and configurable: anyone, requested GitHub reviewers
+      by Discord display/username match, or a specific Discord role.
+    """
+
     def __init__(self, github_url: str | None = None) -> None:
         super().__init__(timeout=None)
         if github_url:
@@ -49,10 +100,7 @@ class PullRequestReviewView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
-        await interaction.response.send_message(
-            "GitHub App review permissions are not configured yet.",
-            ephemeral=True,
-        )
+        await _handle_pr_review_button(interaction, "APPROVE")
 
     @discord.ui.button(
         label="Request Changes",
@@ -65,10 +113,8 @@ class PullRequestReviewView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
-        await interaction.response.send_message(
-            "GitHub App review permissions are not configured yet.",
-            ephemeral=True,
-        )
+        body = f"Changes requested from Discord by {_display_name(interaction.user)}."
+        await _handle_pr_review_button(interaction, "REQUEST_CHANGES", body)
 
     @discord.ui.button(
         label="Comment",
@@ -81,10 +127,12 @@ class PullRequestReviewView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
-        await interaction.response.send_message(
-            "GitHub App comment permissions are not configured yet.",
-            ephemeral=True,
-        )
+        pr_message = await _resolve_pr_message_for_interaction(interaction)
+        if pr_message is None:
+            return
+        if not await _can_use_pr_review_action(interaction, pr_message):
+            return
+        await interaction.response.send_modal(PullRequestCommentModal(pr_message))
 
 
 class NanoGitHubBot(commands.Bot):
@@ -128,9 +176,9 @@ def _require_guild(interaction: discord.Interaction) -> int | None:
 
 async def _ensure_manage_guild(interaction: discord.Interaction) -> bool:
     permissions = interaction.permissions
-    if not permissions.administrator and not permissions.manage_guild:
+    if not permissions.administrator:
         await interaction.response.send_message(
-            "You need the Manage Server permission to configure Nano GitHub.",
+            "You need the Administrator permission to configure Nano GitHub.",
             ephemeral=True,
         )
         return False
@@ -292,6 +340,123 @@ async def set_pr_review_channel(
     )
 
 
+@github_group.command(
+    name="set_review_mode",
+    description="Set who can use pull request review buttons.",
+)
+@app_commands.describe(
+    review_mode="Who can submit PR reviews from Discord",
+    role="Required when using Discord Role Restricted mode",
+)
+@app_commands.choices(
+    review_mode=[
+        app_commands.Choice(name="Anyone", value=REVIEW_MODE_ANYONE),
+        app_commands.Choice(name="GitHub Reviewers Only", value=REVIEW_MODE_GITHUB_REVIEWERS),
+        app_commands.Choice(name="Discord Role Restricted", value=REVIEW_MODE_DISCORD_ROLE),
+    ]
+)
+async def set_review_mode(
+    interaction: discord.Interaction,
+    review_mode: app_commands.Choice[str],
+    role: discord.Role | None = None,
+) -> None:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        await interaction.response.send_message("Run this command in a server.", ephemeral=True)
+        return
+    if not await _ensure_manage_guild(interaction):
+        return
+    if review_mode.value == REVIEW_MODE_DISCORD_ROLE and role is None:
+        await interaction.response.send_message(
+            "Choose a Discord role for Discord Role Restricted mode.",
+            ephemeral=True,
+        )
+        return
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
+    settings = db.set_pr_review_settings(
+        guild_id,
+        review_mode.value,
+        role.id if role else None,
+    )
+    mode_label = _review_mode_label(settings.review_mode, settings.discord_role_id)
+    await interaction.response.send_message(
+        f"PR review mode set to {mode_label}.",
+        ephemeral=True,
+    )
+
+
+@github_group.command(
+    name="app_status",
+    description="Check GitHub App installation and repository permissions.",
+)
+@app_commands.describe(owner="GitHub repository owner or organization", repo="GitHub repository name")
+async def app_status(interaction: discord.Interaction, owner: str, repo: str) -> None:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        await interaction.response.send_message("Run this command in a server.", ephemeral=True)
+        return
+    if not await _ensure_manage_guild(interaction):
+        return
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    linked_repo = db.get_linked_repository(guild_id, owner, repo)
+    if linked_repo is None:
+        await interaction.response.send_message(
+            f"`{owner.strip().lower()}/{repo.strip().lower()}` is not linked to this server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        check = await asyncio.to_thread(
+            check_repository_permissions,
+            linked_repo.owner,
+            linked_repo.repo,
+        )
+    except GitHubAppNotConfigured:
+        await interaction.followup.send(
+            "GitHub App authentication is not configured.",
+            ephemeral=True,
+        )
+        return
+    except GitHubAPIError:
+        LOGGER.exception(
+            "Failed to check GitHub App status for %s/%s",
+            linked_repo.owner,
+            linked_repo.repo,
+        )
+        await interaction.followup.send(
+            "GitHub API request failed while checking repository permissions.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(title="GitHub App Status", color=embeds.NANO_BLUE)
+    embed.add_field(name="Repository", value=f"`{check.owner}/{check.repo}`", inline=False)
+    embed.add_field(name="Installed", value="Yes" if check.installed else "No", inline=True)
+    embed.add_field(
+        name="Issues",
+        value=_permission_status(check.issues, check.can_create_issues),
+        inline=True,
+    )
+    embed.add_field(
+        name="Pull request reviews",
+        value=_permission_status(check.pull_requests, check.can_review_pull_requests),
+        inline=True,
+    )
+    if not check.installed:
+        embed.description = "GitHub App is not installed for this repository."
+    elif not check.can_review_pull_requests:
+        embed.description = (
+            "Nano GitHub does not currently have Pull Request Review permissions "
+            "for this repository."
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @github_group.command(name="status", description="Show Nano GitHub configuration for this server.")
 async def status(interaction: discord.Interaction) -> None:
     guild_id = _require_guild(interaction)
@@ -304,6 +469,8 @@ async def status(interaction: discord.Interaction) -> None:
     repos = config["repositories"]
     log_channels = config["log_channels"]
     pr_channel = config["pr_review_channel"]
+    pr_review_mode = config["pr_review_mode"]
+    pr_review_role_id = config["pr_review_role_id"]
 
     embed = discord.Embed(title="Nano GitHub Status", color=0x2F80ED)
     embed.add_field(
@@ -323,6 +490,11 @@ async def status(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="PR review channel",
         value=f"<#{pr_channel}>" if pr_channel else "Not configured",
+        inline=False,
+    )
+    embed.add_field(
+        name="PR review mode",
+        value=_review_mode_label(pr_review_mode, pr_review_role_id),
         inline=False,
     )
 
@@ -430,6 +602,15 @@ async def create_issue(
             "GitHub App authentication is not configured.",
             ephemeral=True,
         )
+        return
+    except GitHubAppMissingPermission as exc:
+        LOGGER.warning(
+            "GitHub App is missing issue permissions on %s/%s: %s",
+            linked_repo.owner,
+            linked_repo.repo,
+            exc.permission,
+        )
+        await interaction.followup.send(exc.user_message, ephemeral=True)
         return
     except GitHubAPIError as exc:
         LOGGER.warning(
@@ -576,6 +757,148 @@ async def disable_issue_creation(interaction: discord.Interaction) -> None:
     )
 
 
+async def _handle_pr_review_button(
+    interaction: discord.Interaction,
+    event: str,
+    body: str | None = None,
+) -> None:
+    pr_message = await _resolve_pr_message_for_interaction(interaction)
+    if pr_message is None:
+        return
+    if not await _can_use_pr_review_action(interaction, pr_message):
+        return
+    await _submit_pr_review(interaction, pr_message, event, body)
+
+
+async def _resolve_pr_message_for_interaction(
+    interaction: discord.Interaction,
+) -> PrMessage | None:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+        return None
+
+    message_id = getattr(interaction.message, "id", None)
+    if not isinstance(message_id, int):
+        await interaction.response.send_message(
+            "This PR review card could not be identified.",
+            ephemeral=True,
+        )
+        return None
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    pr_message = db.get_pr_message_by_discord_message(guild_id, message_id)
+    if pr_message is None:
+        await interaction.response.send_message(
+            "This PR review card is no longer tracked. Wait for the next PR update.",
+            ephemeral=True,
+        )
+        return None
+    return pr_message
+
+
+async def _can_use_pr_review_action(
+    interaction: discord.Interaction,
+    pr_message: PrMessage,
+) -> bool:
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    settings = db.get_pr_review_settings(pr_message.guild_id)
+
+    if settings.review_mode == REVIEW_MODE_ANYONE:
+        return True
+
+    if settings.review_mode == REVIEW_MODE_DISCORD_ROLE:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        role_ids = {role.id for role in member.roles} if member else set()
+        if settings.discord_role_id and settings.discord_role_id in role_ids:
+            return True
+        await interaction.response.send_message(
+            "Only members with the configured PR review role can use this button.",
+            ephemeral=True,
+        )
+        return False
+
+    if settings.review_mode == REVIEW_MODE_GITHUB_REVIEWERS:
+        discord_names = _discord_identity_names(interaction.user)
+        reviewer_names = {reviewer.lower() for reviewer in pr_message.requested_reviewers}
+        if discord_names & reviewer_names:
+            return True
+
+        if pr_message.requested_teams and not reviewer_names:
+            await interaction.response.send_message(
+                (
+                    "This PR is assigned to a GitHub team. Use Discord Role Restricted "
+                    "review mode for team-based reviews."
+                ),
+                ephemeral=True,
+            )
+            return False
+
+        await interaction.response.send_message(
+            (
+                "Only requested GitHub reviewers can use this button. Nano GitHub matches "
+                "the reviewer login against your Discord username or server display name."
+            ),
+            ephemeral=True,
+        )
+        return False
+
+    await interaction.response.send_message(
+        "PR review mode is not configured correctly for this server.",
+        ephemeral=True,
+    )
+    return False
+
+
+async def _submit_pr_review(
+    interaction: discord.Interaction,
+    pr_message: PrMessage,
+    event: str,
+    body: str | None = None,
+) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        review = await asyncio.to_thread(
+            submit_pull_request_review,
+            pr_message.owner,
+            pr_message.repo,
+            pr_message.pr_number,
+            event,
+            body,
+        )
+    except GitHubAppNotInstalled:
+        await interaction.followup.send(
+            "GitHub App is not installed for this repository.",
+            ephemeral=True,
+        )
+        return
+    except GitHubAppNotConfigured:
+        await interaction.followup.send(
+            "GitHub App authentication is not configured.",
+            ephemeral=True,
+        )
+        return
+    except GitHubAppMissingPermission as exc:
+        await interaction.followup.send(exc.user_message, ephemeral=True)
+        return
+    except GitHubAPIError as exc:
+        LOGGER.warning(
+            "GitHub PR review failed for %s/%s#%s with status %s: %s",
+            pr_message.owner,
+            pr_message.repo,
+            pr_message.pr_number,
+            exc.status_code,
+            exc.message,
+        )
+        await interaction.followup.send(_friendly_pr_review_error(exc), ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        _pr_review_success_message(event, review.url),
+        ephemeral=True,
+    )
+
+
 def _resolve_issue_repository(
     db: Database,
     guild_id: int,
@@ -611,6 +934,55 @@ def _resolve_issue_repository(
     return None, "No default repository configured."
 
 
+def _review_mode_label(review_mode: str, role_id: int | None = None) -> str:
+    if review_mode == REVIEW_MODE_GITHUB_REVIEWERS:
+        return "GitHub Reviewers Only"
+    if review_mode == REVIEW_MODE_DISCORD_ROLE:
+        return f"Discord Role Restricted (<@&{role_id}>)" if role_id else "Discord Role Restricted"
+    return "Anyone"
+
+
+def _permission_status(permission: str | None, allowed: bool) -> str:
+    level = permission or "missing"
+    return f"{level} ({'ready' if allowed else 'missing write access'})"
+
+
+def _friendly_pr_review_error(exc: GitHubAPIError) -> str:
+    if exc.status_code == 403 and (
+        "resource not accessible" in exc.message.lower()
+        or "permission" in exc.message.lower()
+    ):
+        return (
+            "Nano GitHub does not currently have Pull Request Review permissions "
+            "for this repository."
+        )
+    if exc.status_code == 404:
+        return "Nano GitHub could not find that pull request for this repository."
+    return "GitHub API request failed. The pull request review was not submitted."
+
+
+def _pr_review_success_message(event: str, review_url: str | None) -> str:
+    labels = {
+        "APPROVE": "Pull request approved on GitHub.",
+        "REQUEST_CHANGES": "Changes requested on GitHub.",
+        "COMMENT": "Pull request review comment submitted on GitHub.",
+    }
+    message = labels.get(event, "Pull request review submitted on GitHub.")
+    if review_url:
+        return f"{message}\n{review_url}"
+    return message
+
+
+def _discord_identity_names(user: discord.abc.User) -> set[str]:
+    names = {
+        getattr(user, "name", ""),
+        getattr(user, "global_name", "") or "",
+        getattr(user, "display_name", "") or "",
+        str(user).split("#", 1)[0],
+    }
+    return {name.strip().lower() for name in names if name and name.strip()}
+
+
 def _label_for_issue_type(settings: IssueSettings | None, issue_type: str) -> str:
     if issue_type == "bug":
         return settings.bug_label if settings else "bug"
@@ -619,36 +991,23 @@ def _label_for_issue_type(settings: IssueSettings | None, issue_type: str) -> st
 
 def _issue_body(
     interaction: discord.Interaction,
-    issue_type: str,
+    _issue_type: str,
     description: str,
 ) -> str:
-    guild = interaction.guild
-    channel_name = _channel_name(interaction.channel)
     return "\n".join(
         [
             description.strip(),
             "",
             "---",
             "Submitted from Discord",
-            f"Type: {issue_type}",
-            f"Display name: {_display_name(interaction.user)}",
+            "",
             f"Discord username: {interaction.user}",
-            f"Discord user ID: {interaction.user.id}",
-            f"Discord server name: {guild.name if guild else 'Unknown server'}",
-            f"Discord server ID: {interaction.guild_id or 'Unknown server ID'}",
-            f"Channel name: {channel_name}",
-            f"Channel ID: {interaction.channel_id or 'Unknown channel ID'}",
         ]
     )
 
 
 def _display_name(user: discord.abc.User) -> str:
     return getattr(user, "display_name", None) or getattr(user, "name", "Unknown user")
-
-
-def _channel_name(channel: object) -> str:
-    name = getattr(channel, "name", None)
-    return f"#{name}" if isinstance(name, str) and name else "Unknown channel"
 
 
 def _issue_status_embed(settings: IssueSettings | None) -> discord.Embed:

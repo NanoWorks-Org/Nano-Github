@@ -11,6 +11,15 @@ from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
+REVIEW_MODE_ANYONE = "anyone"
+REVIEW_MODE_GITHUB_REVIEWERS = "github_reviewers"
+REVIEW_MODE_DISCORD_ROLE = "discord_role"
+REVIEW_MODES = {
+    REVIEW_MODE_ANYONE,
+    REVIEW_MODE_GITHUB_REVIEWERS,
+    REVIEW_MODE_DISCORD_ROLE,
+}
+
 
 @dataclass(frozen=True)
 class LinkedRepository:
@@ -29,6 +38,15 @@ class PrMessage:
     channel_id: int
     message_id: int
     state: str
+    requested_reviewers: tuple[str, ...]
+    requested_teams: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PrReviewSettings:
+    guild_id: int
+    review_mode: str
+    discord_role_id: int | None
 
 
 @dataclass(frozen=True)
@@ -133,8 +151,19 @@ class Database:
                     channel_id INTEGER NOT NULL,
                     message_id INTEGER NOT NULL,
                     state TEXT NOT NULL,
+                    requested_reviewers TEXT NOT NULL DEFAULT '[]',
+                    requested_teams TEXT NOT NULL DEFAULT '[]',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (guild_id, owner, repo, pr_number),
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS pr_review_settings (
+                    guild_id INTEGER PRIMARY KEY,
+                    review_mode TEXT NOT NULL DEFAULT 'anyone'
+                        CHECK (review_mode IN ('anyone', 'github_reviewers', 'discord_role')),
+                    discord_role_id INTEGER,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
                 );
 
@@ -179,6 +208,7 @@ class Database:
                 """
             )
             self._ensure_webhook_secret_column()
+            self._ensure_pr_message_review_columns()
 
     def upsert_guild(self, guild_id: int, guild_name: str | None = None) -> None:
         with self._lock, self._connection:
@@ -393,11 +423,23 @@ class Database:
                 "SELECT channel_id FROM pr_review_channels WHERE guild_id = ?",
                 (guild_id,),
             ).fetchone()
+            pr_settings = self._connection.execute(
+                """
+                SELECT review_mode, discord_role_id
+                FROM pr_review_settings
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
 
         return {
             "repositories": [(row["owner"], row["repo"]) for row in repos],
             "log_channels": {row["event_type"]: int(row["channel_id"]) for row in log_channels},
             "pr_review_channel": int(pr_channel["channel_id"]) if pr_channel else None,
+            "pr_review_mode": pr_settings["review_mode"] if pr_settings else REVIEW_MODE_ANYONE,
+            "pr_review_role_id": int(pr_settings["discord_role_id"])
+            if pr_settings and pr_settings["discord_role_id"] is not None
+            else None,
         }
 
     def record_webhook_event(
@@ -443,25 +485,49 @@ class Database:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT guild_id, owner, repo, pr_number, channel_id, message_id, state
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    pr_number,
+                    channel_id,
+                    message_id,
+                    state,
+                    requested_reviewers,
+                    requested_teams
                 FROM pr_messages
                 WHERE guild_id = ? AND owner = ? AND repo = ? AND pr_number = ?
                 """,
                 (guild_id, owner, repo, pr_number),
             ).fetchone()
 
-        if not row:
-            return None
+        return _pr_message_from_row(row) if row else None
 
-        return PrMessage(
-            guild_id=int(row["guild_id"]),
-            owner=row["owner"],
-            repo=row["repo"],
-            pr_number=int(row["pr_number"]),
-            channel_id=int(row["channel_id"]),
-            message_id=int(row["message_id"]),
-            state=row["state"],
-        )
+    def get_pr_message_by_discord_message(
+        self,
+        guild_id: int,
+        message_id: int,
+    ) -> PrMessage | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    pr_number,
+                    channel_id,
+                    message_id,
+                    state,
+                    requested_reviewers,
+                    requested_teams
+                FROM pr_messages
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (guild_id, message_id),
+            ).fetchone()
+
+        return _pr_message_from_row(row) if row else None
 
     def upsert_pr_message(
         self,
@@ -472,8 +538,12 @@ class Database:
         channel_id: int,
         message_id: int,
         state: str,
+        requested_reviewers: list[str] | tuple[str, ...] | None = None,
+        requested_teams: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         owner, repo = _normalize_repo(owner, repo)
+        reviewers_json = json.dumps(sorted(_normalize_names(requested_reviewers or [])))
+        teams_json = json.dumps(sorted(_normalize_names(requested_teams or [])))
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -484,17 +554,72 @@ class Database:
                     pr_number,
                     channel_id,
                     message_id,
-                    state
+                    state,
+                    requested_reviewers,
+                    requested_teams
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id, owner, repo, pr_number) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     message_id = excluded.message_id,
                     state = excluded.state,
+                    requested_reviewers = excluded.requested_reviewers,
+                    requested_teams = excluded.requested_teams,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (guild_id, owner, repo, pr_number, channel_id, message_id, state),
+                (
+                    guild_id,
+                    owner,
+                    repo,
+                    pr_number,
+                    channel_id,
+                    message_id,
+                    state,
+                    reviewers_json,
+                    teams_json,
+                ),
             )
+
+    def set_pr_review_settings(
+        self,
+        guild_id: int,
+        review_mode: str,
+        discord_role_id: int | None = None,
+    ) -> PrReviewSettings:
+        if review_mode not in REVIEW_MODES:
+            raise ValueError(f"Unsupported PR review mode: {review_mode}")
+        if review_mode != REVIEW_MODE_DISCORD_ROLE:
+            discord_role_id = None
+
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO pr_review_settings (guild_id, review_mode, discord_role_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    review_mode = excluded.review_mode,
+                    discord_role_id = excluded.discord_role_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (guild_id, review_mode, discord_role_id),
+            )
+
+        return self.get_pr_review_settings(guild_id)
+
+    def get_pr_review_settings(self, guild_id: int) -> PrReviewSettings:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT guild_id, review_mode, discord_role_id
+                FROM pr_review_settings
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+
+        if row:
+            return _pr_review_settings_from_row(row)
+        return PrReviewSettings(guild_id, REVIEW_MODE_ANYONE, None)
 
     def set_issue_settings(
         self,
@@ -682,6 +807,20 @@ class Database:
                 ),
             )
 
+    def _ensure_pr_message_review_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(pr_messages)").fetchall()
+        }
+        if "requested_reviewers" not in columns:
+            self._connection.execute(
+                "ALTER TABLE pr_messages ADD COLUMN requested_reviewers TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "requested_teams" not in columns:
+            self._connection.execute(
+                "ALTER TABLE pr_messages ADD COLUMN requested_teams TEXT NOT NULL DEFAULT '[]'"
+            )
+
 
 def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:
     return owner.strip().lower(), repo.strip().lower()
@@ -691,6 +830,10 @@ def _normalize_label(value: str | None, fallback: str) -> str:
     if not value or not value.strip():
         return fallback
     return value.strip()
+
+
+def _normalize_names(values: list[str] | tuple[str, ...]) -> set[str]:
+    return {value.strip().lower() for value in values if value.strip()}
 
 
 def _generate_webhook_secret() -> str:
@@ -703,6 +846,29 @@ def _linked_repository_from_row(row: sqlite3.Row) -> LinkedRepository:
         owner=row["owner"],
         repo=row["repo"],
         webhook_secret=row["webhook_secret"],
+    )
+
+
+def _pr_message_from_row(row: sqlite3.Row) -> PrMessage:
+    return PrMessage(
+        guild_id=int(row["guild_id"]),
+        owner=row["owner"],
+        repo=row["repo"],
+        pr_number=int(row["pr_number"]),
+        channel_id=int(row["channel_id"]),
+        message_id=int(row["message_id"]),
+        state=row["state"],
+        requested_reviewers=_json_string_tuple(row["requested_reviewers"]),
+        requested_teams=_json_string_tuple(row["requested_teams"]),
+    )
+
+
+def _pr_review_settings_from_row(row: sqlite3.Row) -> PrReviewSettings:
+    role_id = row["discord_role_id"]
+    return PrReviewSettings(
+        guild_id=int(row["guild_id"]),
+        review_mode=row["review_mode"],
+        discord_role_id=int(role_id) if role_id is not None else None,
     )
 
 
@@ -733,3 +899,16 @@ def _issue_submission_from_row(row: sqlite3.Row) -> IssueSubmission:
         title=row["title"],
         created_at=row["created_at"],
     )
+
+
+def _json_string_tuple(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        LOGGER.warning("Ignoring malformed JSON list in PR message row")
+        return ()
+    if not isinstance(data, list):
+        return ()
+    return tuple(item for item in data if isinstance(item, str))

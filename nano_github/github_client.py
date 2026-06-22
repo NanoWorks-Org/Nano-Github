@@ -29,6 +29,34 @@ class CreatedIssue:
     label_error: str | None = None
 
 
+@dataclass(frozen=True)
+class SubmittedPullRequestReview:
+    owner: str
+    repo: str
+    pull_number: int
+    review_id: int
+    url: str | None
+    state: str | None
+
+
+@dataclass(frozen=True)
+class RepositoryPermissionCheck:
+    owner: str
+    repo: str
+    installed: bool
+    installation_id: int | None
+    issues: str | None
+    pull_requests: str | None
+    can_create_issues: bool
+    can_review_pull_requests: bool
+
+
+@dataclass(frozen=True)
+class _InstallationAccess:
+    token: str
+    permissions: dict[str, str]
+
+
 class GitHubClientError(Exception):
     user_message = "GitHub API request failed."
 
@@ -39,6 +67,16 @@ class GitHubAppNotConfigured(GitHubClientError):
 
 class GitHubAppNotInstalled(GitHubClientError):
     user_message = "GitHub App is not installed for this repository."
+
+
+class GitHubAppMissingPermission(GitHubClientError):
+    def __init__(self, permission: str, action: str) -> None:
+        self.permission = permission
+        self.action = action
+        self.user_message = (
+            f"Nano GitHub does not currently have {action} permissions for this repository."
+        )
+        super().__init__(self.user_message)
 
 
 class GitHubAPIError(GitHubClientError):
@@ -87,11 +125,17 @@ def create_issue(
     if installation is None:
         raise GitHubAppNotInstalled()
 
-    token = _create_installation_token(installation.id)
+    access = _create_installation_access(installation.id)
+    _require_permission(
+        access.permissions,
+        "issues",
+        "write",
+        "Issue creation",
+    )
     issue = _request_json(
         "POST",
         f"/repos/{_quote(owner)}/{_quote(repo)}/issues",
-        token=token,
+        token=access.token,
         payload={"title": title, "body": body},
     )
 
@@ -108,7 +152,7 @@ def create_issue(
             _request_json(
                 "POST",
                 f"/repos/{_quote(owner)}/{_quote(repo)}/issues/{number}/labels",
-                token=token,
+                token=access.token,
                 payload={"labels": labels},
             )
             labels_applied = True
@@ -127,7 +171,94 @@ def create_issue(
     )
 
 
+def submit_pull_request_review(
+    owner: str,
+    repo: str,
+    pull_number: int,
+    event: str,
+    body: str | None = None,
+) -> SubmittedPullRequestReview:
+    owner, repo = _normalize_repo(owner, repo)
+    event = event.strip().upper()
+    if event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
+        raise ValueError(f"Unsupported pull request review event: {event}")
+
+    installation = get_installation_for_repo(owner, repo)
+    if installation is None:
+        raise GitHubAppNotInstalled()
+
+    access = _create_installation_access(installation.id)
+    _require_permission(
+        access.permissions,
+        "pull_requests",
+        "write",
+        "Pull Request Review",
+    )
+
+    payload: dict[str, Any] = {"event": event}
+    if body:
+        payload["body"] = body
+    elif event in {"REQUEST_CHANGES", "COMMENT"}:
+        payload["body"] = f"{event.replace('_', ' ').title()} from Nano GitHub."
+
+    review = _request_json(
+        "POST",
+        f"/repos/{_quote(owner)}/{_quote(repo)}/pulls/{pull_number}/reviews",
+        token=access.token,
+        payload=payload,
+    )
+
+    review_id = review.get("id")
+    if not isinstance(review_id, int):
+        raise GitHubAPIError(502, "GitHub pull request review response was missing an id.")
+
+    url = review.get("html_url")
+    state = review.get("state")
+    return SubmittedPullRequestReview(
+        owner=owner,
+        repo=repo,
+        pull_number=pull_number,
+        review_id=review_id,
+        url=url if isinstance(url, str) else None,
+        state=state if isinstance(state, str) else None,
+    )
+
+
+def check_repository_permissions(owner: str, repo: str) -> RepositoryPermissionCheck:
+    owner, repo = _normalize_repo(owner, repo)
+    installation = get_installation_for_repo(owner, repo)
+    if installation is None:
+        return RepositoryPermissionCheck(
+            owner=owner,
+            repo=repo,
+            installed=False,
+            installation_id=None,
+            issues=None,
+            pull_requests=None,
+            can_create_issues=False,
+            can_review_pull_requests=False,
+        )
+
+    access = _create_installation_access(installation.id)
+    issues = access.permissions.get("issues")
+    pull_requests = access.permissions.get("pull_requests")
+    return RepositoryPermissionCheck(
+        owner=owner,
+        repo=repo,
+        installed=True,
+        installation_id=installation.id,
+        issues=issues,
+        pull_requests=pull_requests,
+        can_create_issues=_permission_at_least(issues, "write"),
+        can_review_pull_requests=_permission_at_least(pull_requests, "write"),
+    )
+
+
 def _create_installation_token(installation_id: int) -> str:
+    return _create_installation_access(installation_id).token
+
+
+def _create_installation_access(installation_id: int) -> _InstallationAccess:
     data = _request_json(
         "POST",
         f"/app/installations/{installation_id}/access_tokens",
@@ -136,7 +267,13 @@ def _create_installation_token(installation_id: int) -> str:
     token = data.get("token")
     if not isinstance(token, str) or not token:
         raise GitHubAPIError(502, "GitHub installation token response was missing a token.")
-    return token
+    permissions = data.get("permissions")
+    normalized_permissions = {
+        key: value
+        for key, value in (permissions or {}).items()
+        if isinstance(key, str) and isinstance(value, str)
+    } if isinstance(permissions, dict) else {}
+    return _InstallationAccess(token=token, permissions=normalized_permissions)
 
 
 def _request_json(
@@ -229,6 +366,23 @@ def _quote(value: str) -> str:
 
 def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:
     return owner.strip().lower(), repo.strip().lower()
+
+
+def _require_permission(
+    permissions: dict[str, str],
+    permission: str,
+    required_level: str,
+    action: str,
+) -> None:
+    if not _permission_at_least(permissions.get(permission), required_level):
+        raise GitHubAppMissingPermission(permission, action)
+
+
+def _permission_at_least(actual: str | None, required: str) -> bool:
+    levels = {"read": 1, "write": 2}
+    actual_level = levels.get(actual or "", 0)
+    required_level = levels.get(required, 0)
+    return actual_level >= required_level
 
 
 def _error_message(exc: urllib.error.HTTPError) -> str:

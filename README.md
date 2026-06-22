@@ -5,7 +5,7 @@ Nano GitHub is a Discord bot for GitHub notifications and pull request review wo
 It deliberately separates read-only logging from pull request review:
 
 - **Logging channels** receive normal GitHub event embeds for commits, issues, issue comments, and releases.
-- **Pull request review channels** receive interactive PR review cards with buttons. The MVP buttons do not fake reviews; they reply ephemerally that GitHub App review/comment permissions are not configured yet.
+- **Pull request review channels** receive interactive PR review cards with buttons that submit GitHub Pull Request Reviews through the Nano GitHub GitHub App.
 - **Discord issue creation** lets server members create GitHub suggestions and bug reports through the Nano GitHub GitHub App without needing GitHub accounts.
 
 ## Features
@@ -120,6 +120,7 @@ Then configure Nano GitHub in Discord:
 /github set_log_channel comments #github-comments
 /github set_log_channel releases #github-releases
 /github set_pr_review_channel #pull-request-review
+/github set_review_mode anyone
 /github status
 ```
 
@@ -159,9 +160,9 @@ Repository selection works like this:
 
 Suggestions receive the configured suggestion label, defaulting to `suggestion`. Bugs receive the configured bug label, defaulting to `bug`. If GitHub rejects the labels because they do not exist, the issue is still created and the Discord reply mentions that labels could not be applied.
 
-Created GitHub issues include the submitted description plus Discord metadata: display name, Discord username, user ID, server name, server ID, channel name, and channel ID.
+Created GitHub issues include the submitted description plus a short Discord source footer containing only the Discord username.
 
-Discord users do not need GitHub accounts. Issue creation uses the Nano GitHub GitHub App installation token for the selected repository. The GitHub App must be installed on that repository and have permission to create issues.
+Discord users do not need GitHub accounts. Issue creation uses the Nano GitHub GitHub App installation token for the selected repository. The GitHub App must be installed on that repository and have `Issues: Read and write` permission.
 
 ## GitHub Webhook Setup
 
@@ -205,19 +206,32 @@ Pull requests are workflow events. They are not posted to normal log channels. T
 - Direct GitHub link
 - Buttons for View Pull Request, Approve, Request Changes, and Comment
 
-For the MVP, Approve, Request Changes, and Comment respond ephemerally:
+The button behavior is:
+
+- **View Pull Request** opens GitHub and does not require GitHub API permissions.
+- **Approve** submits a Pull Request Review with event `APPROVE`.
+- **Request Changes** submits a Pull Request Review with event `REQUEST_CHANGES`.
+- **Comment** opens a Discord modal, collects review text, and submits a Pull Request Review with event `COMMENT`.
+
+Review actions use a repository installation token for the linked repository. The GitHub App must have `Pull requests: Read and write` permission. If the permission is missing, Nano GitHub replies with a friendly Discord error such as:
 
 ```text
-GitHub App review permissions are not configured yet.
+Nano GitHub does not currently have Pull Request Review permissions for this repository.
 ```
 
-or:
+PR review actions are configured per Discord server:
 
-```text
-GitHub App comment permissions are not configured yet.
-```
+- `Anyone` allows any server member who can see the PR card to use the review buttons.
+- `GitHub Reviewers Only` allows users whose Discord username or server display name matches a currently requested GitHub reviewer login cached from pull request webhooks.
+- `Discord Role Restricted` allows only members with the configured Discord role.
 
-This is intentional. Nano GitHub does not pretend that a PR was approved or commented on. These buttons are structured so they can later be connected to GitHub's Pull Request Review API through a GitHub App with the right permissions.
+Use `/github app_status owner repo` to verify repository installation, installation token generation, issue creation permission, and pull request review permission.
+
+Required GitHub App repository permissions:
+
+- Metadata: read-only, required by GitHub Apps.
+- Issues: read and write, required for `/issue create`.
+- Pull requests: read and write, required for Approve, Request Changes, and Comment.
 
 ## Webhook Behavior
 
