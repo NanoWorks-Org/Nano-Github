@@ -80,24 +80,58 @@ async def github_webhook(
     repo_info = _repository_info(payload)
     owner = repo_info["owner"]
     repo = repo_info["repo"]
+    repository_full_name = repo_info["full_name"]
+    installation_id = _installation_id(payload)
 
     if not owner or not repo:
+        if installation_id is not None:
+            if not _valid_signature(body, x_hub_signature_256, settings.github_app_webhook_secret):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
+            stored_count = _store_installation_repositories(db, installation_id, payload)
+            LOGGER.info(
+                "Accepted %s installation webhook for installation %s with %s repositories stored",
+                event,
+                installation_id,
+                stored_count,
+            )
+            return {"accepted": True, "event": event, "repositories": stored_count}
         LOGGER.warning("Ignoring %s webhook without repository information", event)
         return {"ignored": True, "reason": "missing repository"}
 
-    linked_repositories = db.find_linked_repositories(owner, repo)
-    if not linked_repositories:
-        LOGGER.info("Ignoring %s for unlinked repository %s/%s", event, owner, repo)
-        return {"ignored": True, "reason": "repository not linked"}
-
-    verified_repositories = _verified_repositories(
+    linked_repositories = _linked_repositories_for_payload(db, owner, repo, installation_id)
+    app_signature_valid = installation_id is not None and _valid_signature(
         body,
         x_hub_signature_256,
-        linked_repositories,
-        settings.github_webhook_secret,
+        settings.github_app_webhook_secret,
     )
-    if not verified_repositories:
+    verified_repositories = _verified_repositories(
+        body=body,
+        signature=x_hub_signature_256,
+        linked_repositories=linked_repositories,
+        app_signature_valid=app_signature_valid,
+        legacy_fallback_secret=settings.github_webhook_secret,
+        installation_id=installation_id,
+    )
+    if not verified_repositories and not (app_signature_valid and not linked_repositories):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
+
+    if installation_id is not None:
+        db.upsert_installed_repository(
+            installation_id,
+            owner,
+            repo,
+            repository_full_name,
+        )
+
+    if not linked_repositories:
+        LOGGER.info(
+            "Accepted %s for installed repository %s/%s installation %s with no linked guild",
+            event,
+            owner,
+            repo,
+            installation_id,
+        )
+        return {"accepted": True, "event": event, "guilds": 0, "reason": "repository not linked"}
 
     guild_ids = [linked_repo.guild_id for linked_repo in verified_repositories]
     db.record_webhook_event(x_github_delivery, event, action, owner, repo, payload)
@@ -142,8 +176,22 @@ def _verified_repositories(
     body: bytes,
     signature: str | None,
     linked_repositories: list[LinkedRepository],
-    fallback_secret: str | None,
+    app_signature_valid: bool,
+    legacy_fallback_secret: str | None,
+    installation_id: int | None,
 ) -> list[LinkedRepository]:
+    if installation_id is not None and app_signature_valid:
+        LOGGER.info(
+            "Accepted GitHub App webhook for %s/%s installation %s",
+            linked_repositories[0].owner if linked_repositories else "unlinked",
+            linked_repositories[0].repo if linked_repositories else "repository",
+            installation_id,
+        )
+        return linked_repositories
+
+    if installation_id is not None and not linked_repositories:
+        return []
+
     verified = [
         linked_repo
         for linked_repo in linked_repositories
@@ -152,7 +200,7 @@ def _verified_repositories(
     if verified:
         return verified
 
-    if fallback_secret and _valid_signature(body, signature, fallback_secret):
+    if legacy_fallback_secret and _valid_signature(body, signature, legacy_fallback_secret):
         LOGGER.warning(
             "Accepted GitHub webhook for %s/%s with fallback GITHUB_WEBHOOK_SECRET",
             linked_repositories[0].owner,
@@ -171,6 +219,60 @@ def _valid_signature(body: bytes, signature: str | None, secret: str | None) -> 
     return hmac.compare_digest(expected, signature)
 
 
+def _linked_repositories_for_payload(
+    db: Database,
+    owner: str,
+    repo: str,
+    installation_id: int | None,
+) -> list[LinkedRepository]:
+    if installation_id is not None:
+        return db.find_linked_repositories_for_installation(installation_id, owner, repo)
+    return db.find_linked_repositories(owner, repo)
+
+
+def _installation_id(payload: dict[str, Any]) -> int | None:
+    installation = payload.get("installation")
+    if not isinstance(installation, dict):
+        return None
+    installation_id = installation.get("id")
+    return installation_id if isinstance(installation_id, int) else None
+
+
+def _store_installation_repositories(
+    db: Database,
+    installation_id: int,
+    payload: dict[str, Any],
+) -> int:
+    stored = 0
+    for repository in _installation_repositories(payload):
+        full_name = repository.get("full_name")
+        owner = (repository.get("owner") or {}).get("login")
+        repo = repository.get("name")
+        if isinstance(full_name, str) and "/" in full_name:
+            full_owner, full_repo = full_name.split("/", 1)
+            owner = owner or full_owner
+            repo = repo or full_repo
+        if not isinstance(owner, str) or not isinstance(repo, str):
+            continue
+        db.upsert_installed_repository(
+            installation_id,
+            owner,
+            repo,
+            full_name if isinstance(full_name, str) else None,
+        )
+        stored += 1
+    return stored
+
+
+def _installation_repositories(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    repositories: list[dict[str, Any]] = []
+    for key in ("repositories", "repositories_added"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            repositories.extend(item for item in value if isinstance(item, dict))
+    return repositories
+
+
 def _repository_info(payload: dict[str, Any]) -> dict[str, str | None]:
     repository = payload.get("repository") or {}
     full_name = repository.get("full_name")
@@ -185,6 +287,7 @@ def _repository_info(payload: dict[str, Any]) -> dict[str, str | None]:
     return {
         "owner": owner.lower() if isinstance(owner, str) else None,
         "repo": repo.lower() if isinstance(repo, str) else None,
+        "full_name": full_name.lower() if isinstance(full_name, str) else None,
     }
 
 

@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     discord_token: str
     github_webhook_secret: str | None = None
+    github_app_webhook_secret: str | None = None
     github_api_base_url: str = "https://api.github.com"
     github_app_id: str | None = None
     github_app_private_key: str | None = None

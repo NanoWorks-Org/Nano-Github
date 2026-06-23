@@ -15,6 +15,7 @@ from nano_github.database import (
     REVIEW_MODE_DISCORD_ROLE,
     REVIEW_MODE_GITHUB_REVIEWERS,
     Database,
+    InstalledRepository,
     IssueSettings,
     LinkedRepository,
     PrMessage,
@@ -190,7 +191,7 @@ class LinkRepositoryModal(discord.ui.Modal, title="Link Repository"):
         await interaction.response.send_message(
             (
                 f"Linked `{linked_repo.owner}/{linked_repo.repo}`. "
-                "Open `/github dashboard` -> Webhook Info for the payload URL and secret status."
+                "Use `/github dashboard` to choose channels and review GitHub App status."
             ),
             ephemeral=True,
         )
@@ -293,6 +294,64 @@ class DashboardRepositorySelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await _edit_dashboard(interaction, "webhook", _parse_repo_value(self.values[0]))
+
+
+class DashboardInstalledRepositorySelect(discord.ui.Select):
+    def __init__(
+        self,
+        installed_repos: list[InstalledRepository],
+        linked_repos: list[LinkedRepository],
+    ) -> None:
+        linked = {(repo.owner, repo.repo) for repo in linked_repos}
+        self.installed_repos_by_value: dict[str, InstalledRepository] = {}
+        options = []
+        for index, installed_repo in enumerate(installed_repos[:25]):
+            value = f"installed:{index}"
+            self.installed_repos_by_value[value] = installed_repo
+            options.append(
+                discord.SelectOption(
+                    label=installed_repo.repository_full_name[:100],
+                    value=value,
+                    description="Linked" if (installed_repo.owner, installed_repo.repo) in linked else "Available",
+                )
+            )
+        super().__init__(
+            placeholder="Link an installed GitHub App repository",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        installed_repo = self.installed_repos_by_value.get(self.values[0])
+        if installed_repo is None:
+            await interaction.response.send_message("Could not identify that repository.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
+        linked_repo = db.link_repository(
+            guild_id,
+            installed_repo.owner,
+            installed_repo.repo,
+            installation_id=installed_repo.installation_id,
+            repository_full_name=installed_repo.repository_full_name,
+        )
+        await interaction.response.send_message(
+            (
+                f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server. "
+                "Use `/github dashboard` to choose channels and defaults."
+            ),
+            ephemeral=True,
+        )
 
 
 class DashboardDefaultRepositorySelect(discord.ui.Select):
@@ -518,9 +577,9 @@ class DashboardIssueToggleButton(discord.ui.Button):
 class DashboardLinkRepositoryButton(discord.ui.Button):
     def __init__(self) -> None:
         super().__init__(
-            label="Link Repository",
+            label="Advanced Manual Link",
             style=discord.ButtonStyle.primary,
-            row=1,
+            row=2,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -600,6 +659,7 @@ class GitHubDashboardView(discord.ui.View):
         section: str,
         *,
         linked_repos: list[LinkedRepository] | None = None,
+        installed_repos: list[InstalledRepository] | None = None,
         selected_repo: tuple[str, str] | None = None,
         pr_review_mode: str = REVIEW_MODE_ANYONE,
         issue_enabled: bool = False,
@@ -609,11 +669,14 @@ class GitHubDashboardView(discord.ui.View):
         self.section = section
         self.selected_repo = selected_repo
         linked_repos = linked_repos or []
+        installed_repos = installed_repos or []
         self.add_item(DashboardNavigationSelect(section))
 
         if section == "pr_reviews":
             self.add_item(DashboardReviewModeSelect(pr_review_mode))
         if section == "repositories":
+            if installed_repos:
+                self.add_item(DashboardInstalledRepositorySelect(installed_repos, linked_repos))
             self.add_item(DashboardLinkRepositoryButton())
         if section == "default_repo" and linked_repos:
             self.add_item(DashboardDefaultRepositorySelect(linked_repos, selected_repo))
@@ -804,7 +867,7 @@ async def link_repo(interaction: discord.Interaction, owner: str, repo: str) -> 
     await interaction.response.send_message(
         (
             f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server. "
-            "Use `/github dashboard` -> Webhook Info to view webhook setup details."
+            "Use `/github dashboard` to choose channels and review GitHub App status."
         ),
         ephemeral=True,
     )
@@ -830,7 +893,7 @@ async def webhook_info(interaction: discord.Interaction, owner: str, repo: str) 
 
     await interaction.response.send_message(
         (
-            f"Webhook info for `{linked_repo.owner}/{linked_repo.repo}`\n"
+            f"Legacy manual webhook info for `{linked_repo.owner}/{linked_repo.repo}`\n"
             f"Payload URL: `{WEBHOOK_PAYLOAD_URL}`\n"
             "Content Type: `application/json`\n"
             f"Secret: `{linked_repo.webhook_secret}`\n"
@@ -860,9 +923,9 @@ async def rotate_secret(interaction: discord.Interaction, owner: str, repo: str)
 
     await interaction.response.send_message(
         (
-            f"Rotated webhook secret for `{linked_repo.owner}/{linked_repo.repo}`.\n"
+            f"Rotated legacy manual webhook secret for `{linked_repo.owner}/{linked_repo.repo}`.\n"
             f"New secret: `{linked_repo.webhook_secret}`\n"
-            "Update the GitHub webhook secret before new deliveries will be accepted."
+            "Update the manual GitHub repository webhook secret before new legacy deliveries will be accepted."
         ),
         ephemeral=True,
     )
@@ -2023,6 +2086,7 @@ async def _build_dashboard(
     db: Database = interaction.client.db  # type: ignore[attr-defined]
     config = db.get_status(guild_id)
     linked_repos = db.list_linked_repositories_for_guild(guild_id)
+    installed_repos = db.list_installed_repositories()
     issue_settings = db.get_issue_settings(guild_id)
     pr_review_mode = str(config["pr_review_mode"])
     pr_review_role_id = config["pr_review_role_id"]
@@ -2044,6 +2108,7 @@ async def _build_dashboard(
         section=section,
         config=config,
         linked_repos=linked_repos,
+        installed_repos=installed_repos,
         issue_settings=issue_settings,
         pr_review_mode=pr_review_mode,
         pr_review_role_id=pr_review_role_id,
@@ -2056,6 +2121,7 @@ async def _build_dashboard(
         guild_id,
         section,
         linked_repos=linked_repos,
+        installed_repos=installed_repos,
         selected_repo=selected_repo,
         pr_review_mode=pr_review_mode,
         issue_enabled=issue_enabled,
@@ -2068,6 +2134,7 @@ def _dashboard_embed(
     section: str,
     config: dict[str, object],
     linked_repos: list[LinkedRepository],
+    installed_repos: list[InstalledRepository],
     issue_settings: IssueSettings | None,
     pr_review_mode: str,
     pr_review_role_id: int | None,
@@ -2088,6 +2155,11 @@ def _dashboard_embed(
     if section == "overview":
         embed.description = "Live server configuration and GitHub integration summary."
         embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
+        embed.add_field(
+            name="GitHub App installed repositories",
+            value=_installed_repo_list(installed_repos, linked_repos),
+            inline=False,
+        )
         embed.add_field(
             name="Default repository",
             value=_default_repo_summary(linked_repos, default_repo),
@@ -2117,11 +2189,19 @@ def _dashboard_embed(
         return embed
 
     if section == "repositories":
-        embed.description = "Linked repositories are scoped to this Discord server."
+        embed.description = "Select repositories already known from GitHub App installations."
         embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
         embed.add_field(
-            name="Edit",
-            value="Use the Link Repository button below. Unlinking remains an advanced maintenance action.",
+            name="Installed repositories",
+            value=_installed_repo_list(installed_repos, linked_repos),
+            inline=False,
+        )
+        embed.add_field(
+            name="Advanced",
+            value=(
+                "Use manual linking only for legacy webhook setups or before the first GitHub App "
+                "webhook delivery has taught Nano GitHub about the installation."
+            ),
             inline=False,
         )
         return embed
@@ -2187,7 +2267,17 @@ def _dashboard_embed(
         return embed
 
     if section == "github_app":
-        embed.description = "Live GitHub App installation and permission checks for linked repositories."
+        embed.description = "Live GitHub App installation and permission checks."
+        embed.add_field(
+            name="Known installed repositories",
+            value=_installed_repo_list(installed_repos, linked_repos),
+            inline=False,
+        )
+        embed.add_field(
+            name="Selected repository",
+            value=_selected_app_repo_status(selected_repo, linked_repos, app_statuses),
+            inline=False,
+        )
         embed.add_field(
             name="Repository readiness",
             value=_app_status_list(app_statuses, linked_repos),
@@ -2201,10 +2291,11 @@ def _dashboard_embed(
         return embed
 
     if section == "webhook":
-        embed.description = "Safe webhook setup details. Secrets are hidden unless revealed per repository."
-        embed.add_field(name="Payload URL", value=f"`{WEBHOOK_PAYLOAD_URL}`", inline=False)
-        embed.add_field(name="Content type", value="`application/json`", inline=True)
-        embed.add_field(name="Events", value=WEBHOOK_EVENTS, inline=False)
+        embed.description = "GitHub App webhooks are automatic. Manual webhooks are legacy/advanced."
+        embed.add_field(name="GitHub App webhook", value="Configured in the GitHub App, no server secret shown.", inline=False)
+        embed.add_field(name="Legacy payload URL", value=f"`{WEBHOOK_PAYLOAD_URL}`", inline=False)
+        embed.add_field(name="Legacy content type", value="`application/json`", inline=True)
+        embed.add_field(name="Legacy events", value=WEBHOOK_EVENTS, inline=False)
         embed.add_field(
             name="Webhook secrets",
             value=_webhook_secret_list(linked_repos, selected_repo),
@@ -2212,7 +2303,7 @@ def _dashboard_embed(
         )
         embed.add_field(
             name="Reveal",
-            value="Select a repository, then use Reveal Secret. Secrets are shown ephemerally only.",
+            value="Only reveal per-repository secrets for legacy manual GitHub webhooks.",
             inline=False,
         )
         return embed
@@ -2247,9 +2338,10 @@ async def _github_app_statuses(
             missing.append("issues:write")
         if not result.can_review_pull_requests:
             missing.append("pull_requests:write")
+        installation = f"installation {result.installation_id}" if result.installation_id else "no installation id"
         if missing:
-            return key, "Missing " + ", ".join(missing)
-        return key, "Ready"
+            return key, f"{installation}; missing " + ", ".join(missing)
+        return key, f"{installation}; issues ready; PR reviews ready"
 
     pairs = await asyncio.gather(*(check(linked_repo) for linked_repo in linked_repos))
     return dict(pairs)
@@ -2258,7 +2350,25 @@ async def _github_app_statuses(
 def _repo_list(linked_repos: list[LinkedRepository]) -> str:
     if not linked_repos:
         return "None linked. Use the dashboard setup guidance to link a repository."
-    return _dashboard_value("\n".join(f"`{repo.owner}/{repo.repo}`" for repo in linked_repos))
+    lines = []
+    for repo in linked_repos:
+        installation = f" installation `{repo.installation_id}`" if repo.installation_id else " no installation id yet"
+        lines.append(f"`{repo.owner}/{repo.repo}`:{installation}")
+    return _dashboard_value("\n".join(lines))
+
+
+def _installed_repo_list(
+    installed_repos: list[InstalledRepository],
+    linked_repos: list[LinkedRepository],
+) -> str:
+    if not installed_repos:
+        return "None known yet. GitHub App webhook deliveries teach Nano GitHub about installations."
+    linked = {(repo.owner, repo.repo) for repo in linked_repos}
+    lines = []
+    for repo in installed_repos:
+        state = "linked" if (repo.owner, repo.repo) in linked else "available"
+        lines.append(f"`{repo.repository_full_name}`: installation `{repo.installation_id}`, {state}")
+    return _dashboard_value("\n".join(lines))
 
 
 def _configured_default_repo(settings: IssueSettings | None) -> tuple[str, str] | None:
@@ -2347,6 +2457,41 @@ def _app_status_list(
         status = app_statuses.get((linked_repo.owner, linked_repo.repo), "Not checked")
         lines.append(f"`{linked_repo.owner}/{linked_repo.repo}`: {status}")
     return _dashboard_value("\n".join(lines))
+
+
+def _selected_app_repo_status(
+    selected_repo: tuple[str, str] | None,
+    linked_repos: list[LinkedRepository],
+    app_statuses: dict[tuple[str, str], str],
+) -> str:
+    if selected_repo is None:
+        return "No linked repository selected."
+    owner, repo = selected_repo
+    linked_repo = next(
+        (
+            candidate
+            for candidate in linked_repos
+            if candidate.owner == owner and candidate.repo == repo
+        ),
+        None,
+    )
+    if linked_repo is None:
+        return f"`{owner}/{repo}` is not linked to this server."
+    installation = (
+        f"`{linked_repo.installation_id}`"
+        if linked_repo.installation_id is not None
+        else "Not recorded yet"
+    )
+    readiness = app_statuses.get((owner, repo), "Not checked")
+    return _dashboard_value(
+        "\n".join(
+            [
+                f"Repository: `{owner}/{repo}`",
+                f"Installation ID: {installation}",
+                f"Actions: {readiness}",
+            ]
+        )
+    )
 
 
 def _webhook_dashboard_summary(linked_repos: list[LinkedRepository]) -> str:

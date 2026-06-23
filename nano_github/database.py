@@ -27,6 +27,16 @@ class LinkedRepository:
     owner: str
     repo: str
     webhook_secret: str
+    installation_id: int | None = None
+    repository_full_name: str | None = None
+
+
+@dataclass(frozen=True)
+class InstalledRepository:
+    installation_id: int
+    owner: str
+    repo: str
+    repository_full_name: str
 
 
 @dataclass(frozen=True)
@@ -107,6 +117,8 @@ class Database:
                     owner TEXT NOT NULL,
                     repo TEXT NOT NULL,
                     webhook_secret TEXT NOT NULL,
+                    installation_id INTEGER,
+                    repository_full_name TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (guild_id, owner, repo),
                     FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
@@ -114,6 +126,21 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_linked_repositories_repo
                     ON linked_repositories(owner, repo);
+
+                CREATE INDEX IF NOT EXISTS idx_linked_repositories_installation
+                    ON linked_repositories(installation_id, owner, repo);
+
+                CREATE TABLE IF NOT EXISTS installed_repositories (
+                    installation_id INTEGER NOT NULL,
+                    owner TEXT NOT NULL,
+                    repo TEXT NOT NULL,
+                    repository_full_name TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (installation_id, owner, repo)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_installed_repositories_repo
+                    ON installed_repositories(owner, repo);
 
                 CREATE TABLE IF NOT EXISTS log_channels (
                     guild_id INTEGER NOT NULL,
@@ -212,6 +239,7 @@ class Database:
                 """
             )
             self._ensure_webhook_secret_column()
+            self._ensure_installation_columns()
             self._ensure_pr_message_review_columns()
             self._ensure_issue_settings_label_columns()
 
@@ -228,20 +256,53 @@ class Database:
                 (guild_id, guild_name),
             )
 
-    def link_repository(self, guild_id: int, owner: str, repo: str) -> LinkedRepository:
+    def link_repository(
+        self,
+        guild_id: int,
+        owner: str,
+        repo: str,
+        installation_id: int | None = None,
+        repository_full_name: str | None = None,
+    ) -> LinkedRepository:
         owner, repo = _normalize_repo(owner, repo)
+        if repository_full_name is None:
+            repository_full_name = f"{owner}/{repo}"
         webhook_secret = _generate_webhook_secret()
         with self._lock, self._connection:
             self._connection.execute(
                 """
-                INSERT OR IGNORE INTO linked_repositories (guild_id, owner, repo, webhook_secret)
-                VALUES (?, ?, ?, ?)
+                INSERT OR IGNORE INTO linked_repositories (
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (guild_id, owner, repo, webhook_secret),
+                (guild_id, owner, repo, webhook_secret, installation_id, repository_full_name),
             )
+            if installation_id is not None:
+                self._connection.execute(
+                    """
+                    UPDATE linked_repositories
+                    SET
+                        installation_id = ?,
+                        repository_full_name = ?
+                    WHERE guild_id = ? AND owner = ? AND repo = ?
+                    """,
+                    (installation_id, repository_full_name, guild_id, owner, repo),
+                )
             row = self._connection.execute(
                 """
-                SELECT guild_id, owner, repo, webhook_secret
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name
                 FROM linked_repositories
                 WHERE guild_id = ? AND owner = ? AND repo = ?
                 """,
@@ -258,17 +319,19 @@ class Database:
                     """,
                     (webhook_secret, guild_id, owner, repo),
                 )
-                return LinkedRepository(guild_id, owner, repo, webhook_secret)
+                return LinkedRepository(
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name,
+                )
 
         if row is None:
             raise RuntimeError("Failed to link repository")
 
-        return LinkedRepository(
-            guild_id=int(row["guild_id"]),
-            owner=row["owner"],
-            repo=row["repo"],
-            webhook_secret=row["webhook_secret"],
-        )
+        return _linked_repository_from_row(row)
 
     def get_linked_repository(
         self,
@@ -280,7 +343,13 @@ class Database:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT guild_id, owner, repo, webhook_secret
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name
                 FROM linked_repositories
                 WHERE guild_id = ? AND owner = ? AND repo = ?
                 """,
@@ -293,7 +362,13 @@ class Database:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT guild_id, owner, repo, webhook_secret
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name
                 FROM linked_repositories
                 WHERE guild_id = ?
                 ORDER BY owner, repo
@@ -321,8 +396,22 @@ class Database:
             )
             if cursor.rowcount == 0:
                 return None
+            row = self._connection.execute(
+                """
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name
+                FROM linked_repositories
+                WHERE guild_id = ? AND owner = ? AND repo = ?
+                """,
+                (guild_id, owner, repo),
+            ).fetchone()
 
-        return LinkedRepository(guild_id, owner, repo, webhook_secret)
+        return _linked_repository_from_row(row) if row else None
 
     def unlink_repositories(self, guild_id: int) -> int:
         with self._lock, self._connection:
@@ -396,13 +485,94 @@ class Database:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT guild_id, owner, repo, webhook_secret
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name
                 FROM linked_repositories
                 WHERE owner = ? AND repo = ?
                 """,
                 (owner, repo),
             ).fetchall()
         return [_linked_repository_from_row(row) for row in rows]
+
+    def find_linked_repositories_for_installation(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+    ) -> list[LinkedRepository]:
+        owner, repo = _normalize_repo(owner, repo)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT
+                    guild_id,
+                    owner,
+                    repo,
+                    webhook_secret,
+                    installation_id,
+                    repository_full_name
+                FROM linked_repositories
+                WHERE owner = ? AND repo = ?
+                    AND (installation_id IS NULL OR installation_id = ?)
+                ORDER BY guild_id
+                """,
+                (owner, repo, installation_id),
+            ).fetchall()
+        return [_linked_repository_from_row(row) for row in rows]
+
+    def upsert_installed_repository(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        repository_full_name: str | None = None,
+    ) -> InstalledRepository:
+        owner, repo = _normalize_repo(owner, repo)
+        repository_full_name = (repository_full_name or f"{owner}/{repo}").strip().lower()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO installed_repositories (
+                    installation_id,
+                    owner,
+                    repo,
+                    repository_full_name
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(installation_id, owner, repo) DO UPDATE SET
+                    repository_full_name = excluded.repository_full_name,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (installation_id, owner, repo, repository_full_name),
+            )
+            self._connection.execute(
+                """
+                UPDATE linked_repositories
+                SET
+                    installation_id = ?,
+                    repository_full_name = ?
+                WHERE owner = ? AND repo = ?
+                    AND (installation_id IS NULL OR installation_id = ?)
+                """,
+                (installation_id, repository_full_name, owner, repo, installation_id),
+            )
+        return InstalledRepository(installation_id, owner, repo, repository_full_name)
+
+    def list_installed_repositories(self) -> list[InstalledRepository]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT installation_id, owner, repo, repository_full_name
+                FROM installed_repositories
+                ORDER BY owner, repo
+                """
+            ).fetchall()
+        return [_installed_repository_from_row(row) for row in rows]
 
     def get_status(self, guild_id: int) -> dict[str, Any]:
         with self._lock:
@@ -922,6 +1092,41 @@ class Database:
                 ),
             )
 
+    def _ensure_installation_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(linked_repositories)").fetchall()
+        }
+        if "installation_id" not in columns:
+            self._connection.execute("ALTER TABLE linked_repositories ADD COLUMN installation_id INTEGER")
+        if "repository_full_name" not in columns:
+            self._connection.execute("ALTER TABLE linked_repositories ADD COLUMN repository_full_name TEXT")
+
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS installed_repositories (
+                installation_id INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                repository_full_name TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (installation_id, owner, repo)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_installed_repositories_repo
+                ON installed_repositories(owner, repo)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_linked_repositories_installation
+                ON linked_repositories(installation_id, owner, repo)
+            """
+        )
+
     def _ensure_pr_message_review_columns(self) -> None:
         columns = {
             row["name"]
@@ -982,11 +1187,23 @@ def _generate_webhook_secret() -> str:
 
 
 def _linked_repository_from_row(row: sqlite3.Row) -> LinkedRepository:
+    installation_id = row["installation_id"]
     return LinkedRepository(
         guild_id=int(row["guild_id"]),
         owner=row["owner"],
         repo=row["repo"],
         webhook_secret=row["webhook_secret"],
+        installation_id=int(installation_id) if installation_id is not None else None,
+        repository_full_name=row["repository_full_name"],
+    )
+
+
+def _installed_repository_from_row(row: sqlite3.Row) -> InstalledRepository:
+    return InstalledRepository(
+        installation_id=int(row["installation_id"]),
+        owner=row["owner"],
+        repo=row["repo"],
+        repository_full_name=row["repository_full_name"],
     )
 
 
