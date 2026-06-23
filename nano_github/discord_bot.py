@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import logging
+import time
 from typing import Literal
 
 import discord
@@ -35,6 +36,7 @@ LOGGER = logging.getLogger(__name__)
 
 LOG_EVENT_TYPES = ("commits", "issues", "comments", "releases")
 LogEventType = Literal["commits", "issues", "comments", "releases"]
+LOG_DASHBOARD_TYPES = (*LOG_EVENT_TYPES, "pr_reviews")
 WEBHOOK_PAYLOAD_URL = "https://api.nanoworks.co.uk/webhooks/github"
 WEBHOOK_EVENTS = "Pushes, Issues, Issue comments, Pull requests, Releases"
 LABEL_FETCH_WARNING = "GitHub labels could not be loaded. You can still create the issue without labels."
@@ -42,6 +44,8 @@ DASHBOARD_ACCESS_MESSAGE = (
     "You need Administrator or Manage Server permission to use the Nano GitHub dashboard."
 )
 ISSUE_CREATION_BLOCKED_MESSAGE = "You are not allowed to create GitHub issues from Discord."
+LABEL_CACHE_TTL_SECONDS = 300
+_LABEL_CACHE: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
 DASHBOARD_SECTIONS = {
     "overview": "Overview",
     "repositories": "Repositories",
@@ -268,6 +272,116 @@ class DashboardReviewModeSelect(discord.ui.Select):
 
         db.set_pr_review_settings(guild_id, review_mode, current.discord_role_id)
         await _edit_dashboard(interaction, "pr_reviews")
+
+
+class DashboardLogTypeSelect(discord.ui.Select):
+    def __init__(self, selected_log_type: str) -> None:
+        options = [
+            discord.SelectOption(
+                label=_log_dashboard_type_label(log_type),
+                value=log_type,
+                default=log_type == selected_log_type,
+            )
+            for log_type in LOG_DASHBOARD_TYPES
+        ]
+        super().__init__(
+            placeholder="Choose log channel to edit",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        await _edit_dashboard(
+            interaction,
+            "logs",
+            selected_log_type=self.values[0],
+        )
+
+
+class DashboardLogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, selected_log_type: str) -> None:
+        self.selected_log_type = selected_log_type
+        super().__init__(
+            placeholder=f"Set {_log_dashboard_type_label(selected_log_type).lower()}",
+            min_values=1,
+            max_values=1,
+            channel_types=[
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+            ],
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        channel = self.values[0] if self.values else None
+        if not _is_sendable_log_channel(interaction, channel):
+            await interaction.response.send_message(
+                "Choose a text channel where Nano GitHub can send messages and embeds.",
+                ephemeral=True,
+            )
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        if self.selected_log_type == "pr_reviews":
+            db.set_pr_review_channel(guild_id, channel.id)
+        else:
+            db.set_log_channel(guild_id, self.selected_log_type, channel.id)
+
+        await _edit_dashboard(
+            interaction,
+            "logs",
+            selected_log_type=self.selected_log_type,
+        )
+        await interaction.followup.send(
+            f"{_log_dashboard_type_label(self.selected_log_type)} set to {channel.mention}.",
+            ephemeral=True,
+        )
+
+
+class DashboardClearLogChannelButton(discord.ui.Button):
+    def __init__(self, selected_log_type: str, disabled: bool) -> None:
+        super().__init__(
+            label="Clear Selected Log",
+            style=discord.ButtonStyle.secondary,
+            row=3,
+            disabled=disabled,
+        )
+        self.selected_log_type = selected_log_type
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        if self.selected_log_type == "pr_reviews":
+            db.clear_pr_review_channel(guild_id)
+        else:
+            db.clear_log_channel(guild_id, self.selected_log_type)
+
+        await _edit_dashboard(
+            interaction,
+            "logs",
+            selected_log_type=self.selected_log_type,
+        )
+        await interaction.followup.send(
+            f"{_log_dashboard_type_label(self.selected_log_type)} cleared.",
+            ephemeral=True,
+        )
 
 
 class DashboardRepositorySelect(discord.ui.Select):
@@ -631,13 +745,77 @@ class DashboardConfigureLabelsButton(discord.ui.Button):
         )
 
 
+class DashboardIssueSubmissionLogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self) -> None:
+        super().__init__(
+            placeholder="Set issue submission log channel",
+            min_values=1,
+            max_values=1,
+            channel_types=[
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+            ],
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        channel = self.values[0] if self.values else None
+        if not _is_sendable_log_channel(interaction, channel):
+            await interaction.response.send_message(
+                "Choose a text channel where Nano GitHub can send messages and embeds.",
+                ephemeral=True,
+            )
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        db.set_issue_submission_log_channel(guild_id, channel.id)
+        await _edit_dashboard(interaction, "issues")
+        await interaction.followup.send(
+            f"Issue submission logs will be sent to {channel.mention}.",
+            ephemeral=True,
+        )
+
+
+class DashboardClearIssueSubmissionLogButton(discord.ui.Button):
+    def __init__(self, disabled: bool) -> None:
+        super().__init__(
+            label="Clear Submission Log",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        db.set_issue_submission_log_channel(guild_id, None)
+        await _edit_dashboard(interaction, "issues")
+        await interaction.followup.send(
+            "Issue submission log channel cleared.",
+            ephemeral=True,
+        )
+
+
 class DashboardAddIssueBlockedRoleSelect(discord.ui.RoleSelect):
     def __init__(self) -> None:
         super().__init__(
             placeholder="Add blocked role",
             min_values=1,
             max_values=10,
-            row=2,
+            row=3,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -666,7 +844,7 @@ class DashboardRemoveIssueBlockedRoleSelect(discord.ui.RoleSelect):
             placeholder="Remove blocked role",
             min_values=1,
             max_values=10,
-            row=3,
+            row=4,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -694,7 +872,7 @@ class DashboardClearIssueBlockedRolesButton(discord.ui.Button):
         super().__init__(
             label="Clear Blocked Roles",
             style=discord.ButtonStyle.danger,
-            row=4,
+            row=1,
             disabled=disabled,
         )
 
@@ -768,16 +946,22 @@ class GitHubDashboardView(discord.ui.View):
         linked_repos: list[LinkedRepository] | None = None,
         installed_repos: list[InstalledRepository] | None = None,
         selected_repo: tuple[str, str] | None = None,
+        selected_log_type: str = "commits",
         pr_review_mode: str = REVIEW_MODE_ANYONE,
         issue_enabled: bool = False,
+        issue_submission_log_channel_id: int | None = None,
         issue_blocked_role_ids: tuple[int, ...] = (),
+        log_channels: dict[str, int] | None = None,
+        pr_review_channel_id: int | None = None,
     ) -> None:
         super().__init__(timeout=300)
         self.guild_id = guild_id
         self.section = section
         self.selected_repo = selected_repo
+        self.selected_log_type = selected_log_type
         linked_repos = linked_repos or []
         installed_repos = installed_repos or []
+        log_channels = log_channels or {}
         self.add_item(DashboardNavigationSelect(section))
 
         if section == "pr_reviews":
@@ -790,9 +974,29 @@ class GitHubDashboardView(discord.ui.View):
             self.add_item(DashboardDefaultRepositorySelect(linked_repos, selected_repo))
         if section == "default_repo":
             self.add_item(DashboardLinkRepositoryButton())
+        if section == "logs":
+            configured_channel_id = (
+                pr_review_channel_id
+                if selected_log_type == "pr_reviews"
+                else log_channels.get(selected_log_type)
+            )
+            self.add_item(DashboardLogTypeSelect(selected_log_type))
+            self.add_item(DashboardLogChannelSelect(selected_log_type))
+            self.add_item(
+                DashboardClearLogChannelButton(
+                    selected_log_type,
+                    disabled=configured_channel_id is None,
+                )
+            )
         if section == "issues":
             self.add_item(DashboardIssueToggleButton(issue_enabled))
             self.add_item(DashboardConfigureLabelsButton())
+            self.add_item(
+                DashboardClearIssueSubmissionLogButton(
+                    disabled=issue_submission_log_channel_id is None,
+                )
+            )
+            self.add_item(DashboardIssueSubmissionLogChannelSelect())
             self.add_item(DashboardAddIssueBlockedRoleSelect())
             self.add_item(DashboardRemoveIssueBlockedRoleSelect())
             self.add_item(
@@ -1293,10 +1497,10 @@ async def issue_labels_autocomplete(
     if linked_repo is None:
         return []
 
-    labels = await _fetch_repository_labels(linked_repo.owner, linked_repo.repo)
     if settings.allowed_labels:
-        allowed = {label.lower() for label in settings.allowed_labels}
-        labels = tuple(label for label in labels if label.lower() in allowed)
+        labels = settings.allowed_labels
+    else:
+        labels = await _fetch_repository_labels(linked_repo.owner, linked_repo.repo)
     query = current.rsplit(",", 1)[-1].strip().lower()
     prefix = current[: len(current) - len(current.rsplit(",", 1)[-1])]
     matches = [label for label in labels if not query or query in label.lower()]
@@ -1377,6 +1581,12 @@ async def create_issue(
         return
 
     requested_labels, blocked_labels = _labels_for_issue_create(settings, labels)
+    if blocked_labels:
+        await interaction.response.send_message(
+            _invalid_label_message(blocked_labels[0], settings.allowed_labels),
+            ephemeral=True,
+        )
+        return
     if labels:
         await _create_issue_from_selection(
             interaction,
@@ -1708,8 +1918,14 @@ async def _fetch_repository_labels(owner: str, repo: str) -> tuple[str, ...]:
 
 
 async def _fetch_repository_label_result(owner: str, repo: str) -> tuple[tuple[str, ...], bool]:
+    cached_labels = _cached_repository_labels(owner, repo)
+    if cached_labels is not None:
+        return cached_labels, False
+
     try:
-        return await asyncio.to_thread(list_repository_labels, owner, repo), False
+        labels = await asyncio.to_thread(list_repository_labels, owner, repo)
+        _cache_repository_labels(owner, repo, labels)
+        return labels, False
     except GitHubAppNotInstalled:
         LOGGER.warning("GitHub App is not installed while fetching labels for %s/%s", owner, repo)
         return (), True
@@ -1728,6 +1944,23 @@ async def _fetch_repository_label_result(owner: str, repo: str) -> tuple[tuple[s
     except Exception:
         LOGGER.exception("Unexpected error while fetching GitHub labels for %s/%s", owner, repo)
         return (), True
+
+
+def _cached_repository_labels(owner: str, repo: str) -> tuple[str, ...] | None:
+    key = (owner.strip().lower(), repo.strip().lower())
+    cached = _LABEL_CACHE.get(key)
+    if cached is None:
+        return None
+    cached_at, labels = cached
+    if time.monotonic() - cached_at > LABEL_CACHE_TTL_SECONDS:
+        _LABEL_CACHE.pop(key, None)
+        return None
+    return labels
+
+
+def _cache_repository_labels(owner: str, repo: str, labels: tuple[str, ...]) -> None:
+    key = (owner.strip().lower(), repo.strip().lower())
+    _LABEL_CACHE[key] = (time.monotonic(), labels)
 
 
 def _issue_create_prompt_embed(
@@ -1859,6 +2092,16 @@ async def _create_issue_from_selection(
             exc.status_code,
             exc.message,
         )
+        if labels and exc.status_code in {400, 422}:
+            await interaction.followup.send(
+                (
+                    "GitHub rejected the selected label"
+                    f"{'s' if len(labels) != 1 else ''}: {', '.join(labels)}. "
+                    "The issue was not created."
+                ),
+                ephemeral=True,
+            )
+            return
         await interaction.followup.send(
             "GitHub API request failed. The issue was not created.",
             ephemeral=True,
@@ -2114,8 +2357,6 @@ async def _send_issue_creation_blocked_log(
     settings = db.get_issue_settings(guild_id)
     log_channel_id = settings.submission_log_channel_id if settings else None
     if log_channel_id is None:
-        log_channel_id = db.get_log_channel(guild_id, "issues")
-    if log_channel_id is None:
         return
 
     log_channel = await _resolve_text_channel(  # type: ignore[arg-type]
@@ -2157,7 +2398,9 @@ def _labels_for_issue_create(
     settings: IssueSettings | None,
     labels: str | None,
 ) -> tuple[list[str], list[str]]:
+    LOGGER.debug("Raw Discord label input: %r", labels)
     parsed_labels = _parse_comma_labels(labels)
+    LOGGER.debug("Parsed Discord label list: %s", parsed_labels)
     if parsed_labels:
         selected_labels = parsed_labels
     elif settings and settings.default_labels:
@@ -2168,10 +2411,15 @@ def _labels_for_issue_create(
     if not settings or not settings.allowed_labels:
         return selected_labels, []
 
-    allowed = {label.lower() for label in settings.allowed_labels}
-    accepted = [label for label in selected_labels if label.lower() in allowed]
+    allowed = {label.lower(): label for label in settings.allowed_labels}
+    accepted = [allowed[label.lower()] for label in selected_labels if label.lower() in allowed]
     blocked = [label for label in selected_labels if label.lower() not in allowed]
     return accepted, blocked
+
+
+def _invalid_label_message(label: str, allowed_labels: tuple[str, ...]) -> str:
+    allowed = ", ".join(allowed_labels) if allowed_labels else "None"
+    return f"Invalid label: {label}. Allowed labels are: {allowed}"
 
 
 def _parse_comma_labels(labels: str | None) -> list[str]:
@@ -2314,11 +2562,18 @@ async def _edit_dashboard(
     interaction: discord.Interaction,
     section: str,
     selected_repo: tuple[str, str] | None = None,
+    *,
+    selected_log_type: str = "commits",
 ) -> None:
     if not await _ensure_dashboard_access(interaction):
         return
     await interaction.response.defer()
-    embed, view = await _build_dashboard(interaction, section, selected_repo)
+    embed, view = await _build_dashboard(
+        interaction,
+        section,
+        selected_repo,
+        selected_log_type=selected_log_type,
+    )
     await interaction.edit_original_response(embed=embed, view=view)
 
 
@@ -2326,6 +2581,8 @@ async def _build_dashboard(
     interaction: discord.Interaction,
     section: str,
     selected_repo: tuple[str, str] | None = None,
+    *,
+    selected_log_type: str = "commits",
 ) -> tuple[discord.Embed, GitHubDashboardView]:
     guild_id = _require_guild(interaction)
     if guild_id is None:
@@ -2340,6 +2597,14 @@ async def _build_dashboard(
     pr_review_mode = str(config["pr_review_mode"])
     pr_review_role_id = config["pr_review_role_id"]
     issue_enabled = bool(issue_settings.enabled) if issue_settings else False
+    log_channels = config["log_channels"]
+    if not isinstance(log_channels, dict):
+        log_channels = {}
+    selected_log_type = (
+        selected_log_type
+        if selected_log_type in LOG_DASHBOARD_TYPES
+        else "commits"
+    )
 
     default_repo = _configured_default_repo(issue_settings)
     if selected_repo is None and section == "default_repo":
@@ -2360,6 +2625,8 @@ async def _build_dashboard(
         installed_repos=installed_repos,
         issue_settings=issue_settings,
         issue_blocked_role_ids=issue_blocked_role_ids,
+        selected_log_type=selected_log_type,
+        guild=interaction.guild,
         pr_review_mode=pr_review_mode,
         pr_review_role_id=pr_review_role_id,
         selected_repo=selected_repo,
@@ -2373,9 +2640,21 @@ async def _build_dashboard(
         linked_repos=linked_repos,
         installed_repos=installed_repos,
         selected_repo=selected_repo,
+        selected_log_type=selected_log_type,
         pr_review_mode=pr_review_mode,
         issue_enabled=issue_enabled,
+        issue_submission_log_channel_id=(
+            issue_settings.submission_log_channel_id if issue_settings else None
+        ),
         issue_blocked_role_ids=issue_blocked_role_ids,
+        log_channels={
+            str(event): int(channel_id)
+            for event, channel_id in log_channels.items()
+            if isinstance(event, str) and isinstance(channel_id, int)
+        },
+        pr_review_channel_id=int(config["pr_review_channel"])
+        if config["pr_review_channel"]
+        else None,
     )
     return embed, view
 
@@ -2388,6 +2667,8 @@ def _dashboard_embed(
     installed_repos: list[InstalledRepository],
     issue_settings: IssueSettings | None,
     issue_blocked_role_ids: tuple[int, ...],
+    selected_log_type: str,
+    guild: discord.Guild | None,
     pr_review_mode: str,
     pr_review_role_id: int | None,
     selected_repo: tuple[str, str] | None,
@@ -2417,7 +2698,11 @@ def _dashboard_embed(
             value=_default_repo_summary(linked_repos, default_repo),
             inline=False,
         )
-        embed.add_field(name="Log channels", value=_log_channel_list(log_channels), inline=False)
+        embed.add_field(
+            name="Log channels",
+            value=_log_channel_list(log_channels, pr_channel, guild),
+            inline=False,
+        )
         embed.add_field(
             name="PR reviews",
             value=(
@@ -2428,7 +2713,7 @@ def _dashboard_embed(
         )
         embed.add_field(
             name="Issue creation",
-            value=_issue_dashboard_summary(issue_settings, issue_blocked_role_ids),
+            value=_issue_dashboard_summary(issue_settings, issue_blocked_role_ids, guild),
             inline=False,
         )
         embed.add_field(
@@ -2478,10 +2763,19 @@ def _dashboard_embed(
 
     if section == "logs":
         embed.description = "Read-only GitHub event logging channels."
-        embed.add_field(name="Configured log channels", value=_log_channel_list(log_channels), inline=False)
         embed.add_field(
-            name="Edit",
-            value="Channel editing is guided here for now; dashboard channel selectors can be added next.",
+            name="Configured log channels",
+            value=_log_channel_list(log_channels, pr_channel, guild),
+            inline=False,
+        )
+        embed.add_field(
+            name="Selected",
+            value=_selected_log_channel_summary(
+                selected_log_type,
+                log_channels,
+                pr_channel,
+                guild,
+            ),
             inline=False,
         )
         return embed
@@ -2508,7 +2802,7 @@ def _dashboard_embed(
         embed.description = "Discord issue creation settings for this server."
         embed.add_field(
             name="Status",
-            value=_issue_dashboard_summary(issue_settings, issue_blocked_role_ids),
+            value=_issue_dashboard_summary(issue_settings, issue_blocked_role_ids, guild),
             inline=False,
         )
         embed.add_field(name="Labels", value=_issue_label_summary(issue_settings), inline=False)
@@ -2649,23 +2943,83 @@ def _default_repo_summary(
     return "No linked repositories."
 
 
-def _log_channel_list(log_channels: dict[object, object]) -> str:
-    if not log_channels:
-        return "None configured."
-    lines = [
-        f"`{event}`: <#{channel_id}>"
-        for event, channel_id in sorted(log_channels.items(), key=lambda item: str(item[0]))
-    ]
+def _log_dashboard_type_label(log_type: str) -> str:
+    labels = {
+        "commits": "Commit logs",
+        "issues": "Issue logs",
+        "comments": "Comment logs",
+        "releases": "Release logs",
+        "pr_reviews": "PR review logs",
+    }
+    return labels.get(log_type, log_type.replace("_", " ").title())
+
+
+def _log_channel_list(
+    log_channels: dict[object, object],
+    pr_channel: object = None,
+    guild: discord.Guild | None = None,
+) -> str:
+    lines = []
+    for log_type in LOG_DASHBOARD_TYPES:
+        lines.append(
+            f"{_log_dashboard_type_label(log_type)}: "
+            f"{_selected_log_channel_display(log_type, log_channels, pr_channel, guild)}"
+        )
     return _dashboard_value("\n".join(lines))
 
 
-def _channel_display(channel_id: object) -> str:
-    return f"<#{channel_id}>" if channel_id else "Not configured"
+def _selected_log_channel_display(
+    log_type: str,
+    log_channels: dict[object, object],
+    pr_channel: object,
+    guild: discord.Guild | None = None,
+) -> str:
+    channel_id = pr_channel if log_type == "pr_reviews" else log_channels.get(log_type)
+    return _channel_display(channel_id, guild)
+
+
+def _selected_log_channel_summary(
+    log_type: str,
+    log_channels: dict[object, object],
+    pr_channel: object,
+    guild: discord.Guild | None = None,
+) -> str:
+    return (
+        f"{_log_dashboard_type_label(log_type)}: "
+        f"{_selected_log_channel_display(log_type, log_channels, pr_channel, guild)}"
+    )
+
+
+def _channel_display(channel_id: object, guild: discord.Guild | None = None) -> str:
+    if not channel_id:
+        return "Not configured"
+    try:
+        resolved_channel_id = int(channel_id)
+    except (TypeError, ValueError):
+        return "Missing/deleted"
+    if guild is not None and guild.get_channel(resolved_channel_id) is None:
+        return f"Missing/deleted (<#{channel_id}>)"
+    return f"<#{channel_id}>"
+
+
+def _is_sendable_log_channel(
+    interaction: discord.Interaction,
+    channel: object,
+) -> bool:
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    guild = interaction.guild
+    bot_member = guild.me if guild else None
+    if bot_member is None:
+        return False
+    permissions = channel.permissions_for(bot_member)
+    return permissions.view_channel and permissions.send_messages and permissions.embed_links
 
 
 def _issue_dashboard_summary(
     settings: IssueSettings | None,
     blocked_role_ids: tuple[int, ...] = (),
+    guild: discord.Guild | None = None,
 ) -> str:
     if settings is None:
         return _dashboard_value(
@@ -2684,11 +3038,7 @@ def _issue_dashboard_summary(
         if settings.default_owner and settings.default_repo
         else "Not configured"
     )
-    log_channel = (
-        f"<#{settings.submission_log_channel_id}>"
-        if settings.submission_log_channel_id
-        else "Not configured"
-    )
+    log_channel = _channel_display(settings.submission_log_channel_id, guild)
     return _dashboard_value(
         "\n".join(
             [

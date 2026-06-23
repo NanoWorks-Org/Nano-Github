@@ -432,6 +432,10 @@ class Database:
     def set_log_channel(self, guild_id: int, event_type: str, channel_id: int) -> None:
         with self._lock, self._connection:
             self._connection.execute(
+                "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)",
+                (guild_id,),
+            )
+            self._connection.execute(
                 """
                 INSERT INTO log_channels (guild_id, event_type, channel_id)
                 VALUES (?, ?, ?)
@@ -454,8 +458,19 @@ class Database:
             ).fetchone()
         return int(row["channel_id"]) if row else None
 
+    def clear_log_channel(self, guild_id: int, event_type: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM log_channels WHERE guild_id = ? AND event_type = ?",
+                (guild_id, event_type),
+            )
+
     def set_pr_review_channel(self, guild_id: int, channel_id: int) -> None:
         with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)",
+                (guild_id,),
+            )
             self._connection.execute(
                 """
                 INSERT INTO pr_review_channels (guild_id, channel_id)
@@ -474,6 +489,13 @@ class Database:
                 (guild_id,),
             ).fetchone()
         return int(row["channel_id"]) if row else None
+
+    def clear_pr_review_channel(self, guild_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM pr_review_channels WHERE guild_id = ?",
+                (guild_id,),
+            )
 
     def find_guilds_for_repository(self, owner: str, repo: str) -> list[int]:
         owner, repo = _normalize_repo(owner, repo)
@@ -948,6 +970,43 @@ class Database:
             default_labels=current.default_labels if current else (),
             submission_log_channel_id=current.submission_log_channel_id if current else None,
         )
+
+    def set_issue_submission_log_channel(
+        self,
+        guild_id: int,
+        channel_id: int | None,
+    ) -> IssueSettings:
+        current = self.get_issue_settings(guild_id)
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)",
+                (guild_id,),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO issue_settings (
+                    guild_id,
+                    suggestion_label,
+                    bug_label,
+                    allowed_labels,
+                    default_labels,
+                    submission_log_channel_id,
+                    enabled
+                )
+                VALUES (?, 'suggestion', 'bug', '[]', '[]', ?, 1)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    submission_log_channel_id = excluded.submission_log_channel_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (guild_id, channel_id),
+            )
+
+        settings = self.get_issue_settings(guild_id)
+        if settings is None:
+            raise RuntimeError("Failed to update issue submission log channel")
+        if current is None:
+            return settings
+        return settings
 
     def get_issue_blocked_roles(self, guild_id: int) -> tuple[int, ...]:
         with self._lock:

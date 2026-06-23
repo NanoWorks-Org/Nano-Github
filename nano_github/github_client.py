@@ -125,6 +125,7 @@ def create_issue(
 ) -> CreatedIssue:
     owner, repo = _normalize_repo(owner, repo)
     labels = [label.strip() for label in labels or [] if label.strip()]
+    LOGGER.debug("Preparing GitHub issue labels for %s/%s: %s", owner, repo, labels)
 
     installation = get_installation_for_repo(owner, repo)
     if installation is None:
@@ -137,12 +138,34 @@ def create_issue(
         "write",
         "Issue creation",
     )
-    issue = _request_json(
-        "POST",
-        f"/repos/{_quote(owner)}/{_quote(repo)}/issues",
-        token=access.token,
-        payload={"title": title, "body": body},
+
+    payload: dict[str, Any] = {"title": title, "body": body}
+    if labels:
+        payload["labels"] = labels
+    LOGGER.debug(
+        "GitHub issue payload labels for %s/%s: %s",
+        owner,
+        repo,
+        payload.get("labels", []),
     )
+    try:
+        issue = _request_json(
+            "POST",
+            f"/repos/{_quote(owner)}/{_quote(repo)}/issues",
+            token=access.token,
+            payload=payload,
+        )
+    except GitHubAPIError as exc:
+        if labels:
+            LOGGER.warning(
+                "GitHub rejected issue creation labels for %s/%s: labels=%s status=%s body=%s",
+                owner,
+                repo,
+                labels,
+                exc.status_code,
+                exc.message,
+            )
+        raise
 
     number = issue.get("number")
     url = issue.get("html_url")
@@ -150,54 +173,16 @@ def create_issue(
     if not isinstance(number, int) or not isinstance(url, str):
         raise GitHubAPIError(502, "GitHub issue response was missing issue details.")
 
-    applied_labels: list[str] = []
-    failed_labels: list[str] = []
-    labels_applied = not labels
-    label_error: str | None = None
-    if labels:
-        try:
-            repository_labels = _repository_label_names(owner, repo, access.token)
-        except GitHubAPIError as exc:
-            return CreatedIssue(
-                owner=owner,
-                repo=repo,
-                number=number,
-                title=created_title if isinstance(created_title, str) else title,
-                url=url,
-                labels_applied=False,
-                failed_labels=tuple(labels),
-                label_error=f"GitHub label lookup failed ({exc.status_code}).",
-            )
-        valid_labels = [label for label in labels if label.lower() in repository_labels]
-        failed_labels = [label for label in labels if label.lower() not in repository_labels]
-        if valid_labels:
-            try:
-                _request_json(
-                    "POST",
-                    f"/repos/{_quote(owner)}/{_quote(repo)}/issues/{number}/labels",
-                    token=access.token,
-                    payload={"labels": valid_labels},
-                )
-                applied_labels = valid_labels
-            except GitHubAPIError as exc:
-                failed_labels = labels
-                label_error = f"GitHub rejected issue labels ({exc.status_code})."
-        if failed_labels and label_error is None:
-            label_error = "These labels do not exist: " + ", ".join(failed_labels)
-        labels_applied = bool(labels) and not failed_labels and len(applied_labels) == len(labels)
-        if valid_labels and not applied_labels:
-            labels_applied = False
-
     return CreatedIssue(
         owner=owner,
         repo=repo,
         number=number,
         title=created_title if isinstance(created_title, str) else title,
         url=url,
-        labels_applied=labels_applied,
-        labels=tuple(applied_labels),
-        failed_labels=tuple(failed_labels),
-        label_error=label_error,
+        labels_applied=True,
+        labels=tuple(labels),
+        failed_labels=(),
+        label_error=None,
     )
 
 
@@ -395,6 +380,13 @@ def _request_json_value(
             response_body = response.read()
     except urllib.error.HTTPError as exc:
         message = _error_message(exc)
+        LOGGER.debug(
+            "GitHub API response failure: method=%s path=%s status=%s body=%s",
+            method,
+            path,
+            exc.code,
+            message,
+        )
         raise GitHubAPIError(exc.code, message) from exc
     except urllib.error.URLError as exc:
         raise GitHubAPIError(503, str(exc.reason)) from exc
