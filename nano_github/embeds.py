@@ -335,6 +335,30 @@ def issue_submission_log_embed(
     return embed
 
 
+def issue_creation_blocked_attempt_embed(
+    *,
+    user: str,
+    guild: str,
+    blocked_roles: tuple[str, ...],
+) -> discord.Embed:
+    timestamp = discord.utils.utcnow()
+    embed = discord.Embed(
+        title="Blocked Discord issue creation attempt",
+        color=NANO_RED,
+    )
+    embed.add_field(name="User", value=user, inline=False)
+    embed.add_field(name="Guild", value=guild, inline=False)
+    embed.add_field(
+        name="Blocked roles",
+        value=", ".join(blocked_roles) if blocked_roles else "Unknown",
+        inline=False,
+    )
+    embed.add_field(name="Attempted action", value="Issue creation", inline=True)
+    embed.add_field(name="Timestamp", value=f"<t:{int(timestamp.timestamp())}:f>", inline=True)
+    embed.timestamp = timestamp
+    return embed
+
+
 def _pr_color(action: str, state: str, draft: bool) -> int:
     if state == "merged":
         return NANO_BLUE

@@ -236,12 +236,20 @@ class Database:
                     PRIMARY KEY (guild_id, role_id, rule_type),
                     FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS issue_blocked_roles (
+                    guild_id INTEGER NOT NULL,
+                    role_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, role_id),
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
                 """
             )
             self._ensure_webhook_secret_column()
             self._ensure_installation_columns()
             self._ensure_pr_message_review_columns()
             self._ensure_issue_settings_label_columns()
+            self._ensure_issue_blocked_roles_table()
 
     def upsert_guild(self, guild_id: int, guild_name: str | None = None) -> None:
         with self._lock, self._connection:
@@ -941,6 +949,50 @@ class Database:
             submission_log_channel_id=current.submission_log_channel_id if current else None,
         )
 
+    def get_issue_blocked_roles(self, guild_id: int) -> tuple[int, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT role_id
+                FROM issue_blocked_roles
+                WHERE guild_id = ?
+                ORDER BY role_id
+                """,
+                (guild_id,),
+            ).fetchall()
+        return tuple(int(row["role_id"]) for row in rows)
+
+    def add_issue_blocked_role(self, guild_id: int, role_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)",
+                (guild_id,),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO issue_blocked_roles (guild_id, role_id)
+                VALUES (?, ?)
+                """,
+                (guild_id, role_id),
+            )
+
+    def remove_issue_blocked_role(self, guild_id: int, role_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                DELETE FROM issue_blocked_roles
+                WHERE guild_id = ? AND role_id = ?
+                """,
+                (guild_id, role_id),
+            )
+
+    def clear_issue_blocked_roles(self, guild_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM issue_blocked_roles WHERE guild_id = ?",
+                (guild_id,),
+            )
+
     def record_issue_submission(
         self,
         guild_id: int,
@@ -1154,6 +1206,18 @@ class Database:
             self._connection.execute(
                 "ALTER TABLE issue_settings ADD COLUMN default_labels TEXT NOT NULL DEFAULT '[]'"
             )
+
+    def _ensure_issue_blocked_roles_table(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS issue_blocked_roles (
+                guild_id INTEGER NOT NULL,
+                role_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, role_id),
+                FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+            )
+            """
+        )
 
 
 def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:

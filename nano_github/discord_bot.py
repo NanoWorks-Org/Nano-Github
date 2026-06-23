@@ -41,6 +41,7 @@ LABEL_FETCH_WARNING = "GitHub labels could not be loaded. You can still create t
 DASHBOARD_ACCESS_MESSAGE = (
     "You need Administrator or Manage Server permission to use the Nano GitHub dashboard."
 )
+ISSUE_CREATION_BLOCKED_MESSAGE = "You are not allowed to create GitHub issues from Discord."
 DASHBOARD_SECTIONS = {
     "overview": "Overview",
     "repositories": "Repositories",
@@ -423,6 +424,8 @@ class IssueRepositorySelect(discord.ui.Select):
                 ephemeral=True,
             )
             return
+        if await _reject_if_issue_creation_blocked(interaction):
+            return
         selected_repo = _parse_repo_value(self.values[0])
         if selected_repo is None:
             await interaction.response.send_message("Could not identify that repository.", ephemeral=True)
@@ -493,6 +496,8 @@ class IssueLabelSelect(discord.ui.Select):
                 ephemeral=True,
             )
             return
+        if await _reject_if_issue_creation_blocked(interaction):
+            return
         self.issue_view.selected_labels = list(self.values)
         await interaction.response.defer()
 
@@ -508,6 +513,8 @@ class IssueCreateButton(discord.ui.Button):
                 "Only the user who started this issue can use this button.",
                 ephemeral=True,
             )
+            return
+        if await _reject_if_issue_creation_blocked(interaction):
             return
         if self.issue_view.linked_repo is None:
             await interaction.response.send_message("Choose a repository first.", ephemeral=True)
@@ -619,7 +626,93 @@ class DashboardConfigureLabelsButton(discord.ui.Button):
             return
 
         db: Database = interaction.client.db  # type: ignore[attr-defined]
-        await interaction.response.send_modal(IssueLabelsModal(guild_id, db.get_issue_settings(guild_id)))
+        await interaction.response.send_modal(
+            IssueLabelsModal(guild_id, db.get_issue_settings(guild_id))
+        )
+
+
+class DashboardAddIssueBlockedRoleSelect(discord.ui.RoleSelect):
+    def __init__(self) -> None:
+        super().__init__(
+            placeholder="Add blocked role",
+            min_values=1,
+            max_values=10,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        selected_roles = [role for role in self.values if isinstance(role, discord.Role)]
+        for role in selected_roles:
+            db.add_issue_blocked_role(guild_id, role.id)
+
+        await _edit_dashboard(interaction, "issues")
+        await interaction.followup.send(
+            "Blocked role settings updated.",
+            ephemeral=True,
+        )
+
+
+class DashboardRemoveIssueBlockedRoleSelect(discord.ui.RoleSelect):
+    def __init__(self) -> None:
+        super().__init__(
+            placeholder="Remove blocked role",
+            min_values=1,
+            max_values=10,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        selected_roles = [role for role in self.values if isinstance(role, discord.Role)]
+        for role in selected_roles:
+            db.remove_issue_blocked_role(guild_id, role.id)
+
+        await _edit_dashboard(interaction, "issues")
+        await interaction.followup.send(
+            "Blocked role settings updated.",
+            ephemeral=True,
+        )
+
+
+class DashboardClearIssueBlockedRolesButton(discord.ui.Button):
+    def __init__(self, disabled: bool) -> None:
+        super().__init__(
+            label="Clear Blocked Roles",
+            style=discord.ButtonStyle.danger,
+            row=4,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        db.clear_issue_blocked_roles(guild_id)
+        await _edit_dashboard(interaction, "issues")
+        await interaction.followup.send(
+            "Blocked role settings cleared.",
+            ephemeral=True,
+        )
 
 
 class DashboardRevealSecretButton(discord.ui.Button):
@@ -677,6 +770,7 @@ class GitHubDashboardView(discord.ui.View):
         selected_repo: tuple[str, str] | None = None,
         pr_review_mode: str = REVIEW_MODE_ANYONE,
         issue_enabled: bool = False,
+        issue_blocked_role_ids: tuple[int, ...] = (),
     ) -> None:
         super().__init__(timeout=300)
         self.guild_id = guild_id
@@ -699,6 +793,11 @@ class GitHubDashboardView(discord.ui.View):
         if section == "issues":
             self.add_item(DashboardIssueToggleButton(issue_enabled))
             self.add_item(DashboardConfigureLabelsButton())
+            self.add_item(DashboardAddIssueBlockedRoleSelect())
+            self.add_item(DashboardRemoveIssueBlockedRoleSelect())
+            self.add_item(
+                DashboardClearIssueBlockedRolesButton(disabled=not issue_blocked_role_ids)
+            )
         if section == "webhook":
             if linked_repos:
                 self.add_item(DashboardRepositorySelect(linked_repos, selected_repo))
@@ -1232,6 +1331,9 @@ async def create_issue(
         return
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
+    if await _reject_if_issue_creation_blocked(interaction):
+        return
+
     settings = _effective_issue_settings(db, guild_id)
     if settings and not settings.enabled:
         await interaction.response.send_message(
@@ -1703,6 +1805,9 @@ async def _create_issue_from_selection(
         return
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
+    if await _reject_if_issue_creation_blocked(interaction):
+        return
+
     settings = _effective_issue_settings(db, guild_id)
     if interaction.response.is_done():
         await interaction.followup.send("Creating GitHub issue...", ephemeral=True)
@@ -1952,6 +2057,102 @@ def _discord_identity_names(user: discord.abc.User) -> set[str]:
     return {name.strip().lower() for name in names if name and name.strip()}
 
 
+def member_is_blocked_from_issue_creation(
+    member: discord.Member,
+    db: Database | None = None,
+) -> bool:
+    if db is None:
+        return False
+    return bool(_issue_creation_blocked_roles(member, db))
+
+
+def _issue_creation_blocked_roles(
+    member: discord.Member,
+    db: Database,
+) -> tuple[discord.Role, ...]:
+    blocked_role_ids = set(db.get_issue_blocked_roles(member.guild.id))
+    if not blocked_role_ids:
+        return ()
+    return tuple(role for role in member.roles if role.id in blocked_role_ids)
+
+
+async def _reject_if_issue_creation_blocked(interaction: discord.Interaction) -> bool:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        if interaction.response.is_done():
+            await interaction.followup.send("Run this action in a server.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+        return True
+
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if member is None:
+        return False
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    blocked_roles = _issue_creation_blocked_roles(member, db)
+    if not blocked_roles:
+        return False
+
+    if interaction.response.is_done():
+        await interaction.followup.send(ISSUE_CREATION_BLOCKED_MESSAGE, ephemeral=True)
+    else:
+        await interaction.response.send_message(ISSUE_CREATION_BLOCKED_MESSAGE, ephemeral=True)
+    await _send_issue_creation_blocked_log(interaction, blocked_roles)
+    return True
+
+
+async def _send_issue_creation_blocked_log(
+    interaction: discord.Interaction,
+    blocked_roles: tuple[discord.Role, ...],
+) -> None:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        return
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    settings = db.get_issue_settings(guild_id)
+    log_channel_id = settings.submission_log_channel_id if settings else None
+    if log_channel_id is None:
+        log_channel_id = db.get_log_channel(guild_id, "issues")
+    if log_channel_id is None:
+        return
+
+    log_channel = await _resolve_text_channel(  # type: ignore[arg-type]
+        interaction.client,
+        log_channel_id,
+    )
+    if log_channel is None:
+        LOGGER.warning(
+            "Configured issue creation blocked-attempt log channel %s is unavailable",
+            log_channel_id,
+        )
+        return
+
+    guild_label = (
+        f"{interaction.guild.name} ({guild_id})"
+        if interaction.guild
+        else f"Guild {guild_id}"
+    )
+    embed = embeds.issue_creation_blocked_attempt_embed(
+        user=f"{interaction.user.mention} ({interaction.user.id})",
+        guild=guild_label,
+        blocked_roles=tuple(role.mention for role in blocked_roles),
+    )
+    try:
+        await log_channel.send(embed=embed)
+    except discord.Forbidden:
+        LOGGER.warning(
+            "Missing permission to send issue creation blocked-attempt log to channel %s",
+            log_channel_id,
+        )
+    except discord.HTTPException:
+        LOGGER.exception(
+            "Failed to send issue creation blocked-attempt log to channel %s",
+            log_channel_id,
+        )
+
+
 def _labels_for_issue_create(
     settings: IssueSettings | None,
     labels: str | None,
@@ -1991,6 +2192,12 @@ def _label_summary(labels: list[str] | tuple[str, ...]) -> str:
 
 def _label_list_display(labels: list[str] | tuple[str, ...]) -> str:
     return ", ".join(f"`{label}`" for label in labels) if labels else "None"
+
+
+def _blocked_role_display(role_ids: tuple[int, ...]) -> str:
+    if not role_ids:
+        return "None"
+    return _dashboard_value(", ".join(f"<@&{role_id}>" for role_id in role_ids), limit=900)
 
 
 def _combined_label_error(github_error: str | None, blocked_labels: list[str]) -> str | None:
@@ -2129,6 +2336,7 @@ async def _build_dashboard(
     linked_repos = db.list_linked_repositories_for_guild(guild_id)
     installed_repos = db.list_installed_repositories()
     issue_settings = db.get_issue_settings(guild_id)
+    issue_blocked_role_ids = db.get_issue_blocked_roles(guild_id)
     pr_review_mode = str(config["pr_review_mode"])
     pr_review_role_id = config["pr_review_role_id"]
     issue_enabled = bool(issue_settings.enabled) if issue_settings else False
@@ -2151,6 +2359,7 @@ async def _build_dashboard(
         linked_repos=linked_repos,
         installed_repos=installed_repos,
         issue_settings=issue_settings,
+        issue_blocked_role_ids=issue_blocked_role_ids,
         pr_review_mode=pr_review_mode,
         pr_review_role_id=pr_review_role_id,
         selected_repo=selected_repo,
@@ -2166,6 +2375,7 @@ async def _build_dashboard(
         selected_repo=selected_repo,
         pr_review_mode=pr_review_mode,
         issue_enabled=issue_enabled,
+        issue_blocked_role_ids=issue_blocked_role_ids,
     )
     return embed, view
 
@@ -2177,6 +2387,7 @@ def _dashboard_embed(
     linked_repos: list[LinkedRepository],
     installed_repos: list[InstalledRepository],
     issue_settings: IssueSettings | None,
+    issue_blocked_role_ids: tuple[int, ...],
     pr_review_mode: str,
     pr_review_role_id: int | None,
     selected_repo: tuple[str, str] | None,
@@ -2217,7 +2428,7 @@ def _dashboard_embed(
         )
         embed.add_field(
             name="Issue creation",
-            value=_issue_dashboard_summary(issue_settings),
+            value=_issue_dashboard_summary(issue_settings, issue_blocked_role_ids),
             inline=False,
         )
         embed.add_field(
@@ -2295,13 +2506,18 @@ def _dashboard_embed(
 
     if section == "issues":
         embed.description = "Discord issue creation settings for this server."
-        embed.add_field(name="Status", value=_issue_dashboard_summary(issue_settings), inline=False)
+        embed.add_field(
+            name="Status",
+            value=_issue_dashboard_summary(issue_settings, issue_blocked_role_ids),
+            inline=False,
+        )
         embed.add_field(name="Labels", value=_issue_label_summary(issue_settings), inline=False)
         embed.add_field(
             name="Edit",
             value=(
-                "Use the buttons below to enable or disable issue creation and edit labels. "
-                "Use Default Repository to change where issues are created by default."
+                "Use the controls below to enable or disable issue creation, edit labels, "
+                "and manage blocked roles. Use Default Repository to change where issues "
+                "are created by default."
             ),
             inline=False,
         )
@@ -2447,9 +2663,22 @@ def _channel_display(channel_id: object) -> str:
     return f"<#{channel_id}>" if channel_id else "Not configured"
 
 
-def _issue_dashboard_summary(settings: IssueSettings | None) -> str:
+def _issue_dashboard_summary(
+    settings: IssueSettings | None,
+    blocked_role_ids: tuple[int, ...] = (),
+) -> str:
     if settings is None:
-        return "Enabled with automatic defaults. Configure labels and default repository in the dashboard."
+        return _dashboard_value(
+            "\n".join(
+                [
+                    (
+                        "Enabled with automatic defaults. Configure labels and default "
+                        "repository in the dashboard."
+                    ),
+                    f"Blocked roles: {_blocked_role_display(blocked_role_ids)}",
+                ]
+            )
+        )
     default_repo = (
         f"`{settings.default_owner}/{settings.default_repo}`"
         if settings.default_owner and settings.default_repo
@@ -2466,6 +2695,7 @@ def _issue_dashboard_summary(settings: IssueSettings | None) -> str:
                 f"Enabled: {'Yes' if settings.enabled else 'No'}",
                 f"Default repository: {default_repo}",
                 f"Submission log: {log_channel}",
+                f"Blocked roles: {_blocked_role_display(blocked_role_ids)}",
             ]
         )
     )
@@ -2478,7 +2708,11 @@ def _issue_label_summary(settings: IssueSettings | None) -> str:
         "\n".join(
             [
                 "Allowed labels: "
-                + (_label_list_display(settings.allowed_labels) if settings.allowed_labels else "Any"),
+                + (
+                    _label_list_display(settings.allowed_labels)
+                    if settings.allowed_labels
+                    else "Any"
+                ),
                 f"Default labels: {_label_list_display(settings.default_labels)}",
                 f"Suggestion quick label: `{settings.suggestion_label}`",
                 f"Bug quick label: `{settings.bug_label}`",
