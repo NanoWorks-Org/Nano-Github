@@ -198,8 +198,18 @@ def create_issue(
     )
 
 
-def _repository_label_names(owner: str, repo: str, token: str) -> set[str]:
-    labels: set[str] = set()
+def list_repository_labels(owner: str, repo: str) -> tuple[str, ...]:
+    owner, repo = _normalize_repo(owner, repo)
+    installation = get_installation_for_repo(owner, repo)
+    if installation is None:
+        raise GitHubAppNotInstalled()
+
+    access = _create_installation_access(installation.id)
+    return tuple(_repository_label_names(owner, repo, access.token).values())
+
+
+def _repository_label_names(owner: str, repo: str, token: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
     page = 1
     while True:
         page_labels = _request_json(
@@ -209,13 +219,12 @@ def _repository_label_names(owner: str, repo: str, token: str) -> set[str]:
         )
         if not isinstance(page_labels, list):
             raise GitHubAPIError(502, "GitHub labels response was malformed.")
-        labels.update(
-            label["name"].strip().lower()
-            for label in page_labels
-            if isinstance(label, dict)
-            and isinstance(label.get("name"), str)
-            and label["name"].strip()
-        )
+        for label in page_labels:
+            if not isinstance(label, dict) or not isinstance(label.get("name"), str):
+                continue
+            name = label["name"].strip()
+            if name:
+                labels[name.lower()] = name
         if len(page_labels) < 100:
             return labels
         page += 1

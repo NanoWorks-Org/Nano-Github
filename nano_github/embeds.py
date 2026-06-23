@@ -343,7 +343,7 @@ def _pr_color(action: str, state: str, draft: bool) -> int:
     if draft:
         return NANO_GOLD
     if action in {"opened", "reopened", "ready for review"}:
-        return NANO_GREEN
+        return NANO_GOLD
     return NANO_DARK_BLUE
 
 

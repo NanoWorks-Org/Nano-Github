@@ -752,6 +752,25 @@ class Database:
             raise RuntimeError("Failed to update issue creation status")
         return settings
 
+    def set_issue_default_repository(
+        self,
+        guild_id: int,
+        default_owner: str,
+        default_repo: str,
+    ) -> IssueSettings:
+        default_owner, default_repo = _normalize_repo(default_owner, default_repo)
+        current = self.get_issue_settings(guild_id)
+        return self.set_issue_settings(
+            guild_id,
+            default_owner,
+            default_repo,
+            suggestion_label=current.suggestion_label if current else "suggestion",
+            bug_label=current.bug_label if current else "bug",
+            allowed_labels=current.allowed_labels if current else (),
+            default_labels=current.default_labels if current else (),
+            submission_log_channel_id=current.submission_log_channel_id if current else None,
+        )
+
     def record_issue_submission(
         self,
         guild_id: int,
