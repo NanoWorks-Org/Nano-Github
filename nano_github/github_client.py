@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 import urllib.parse
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from nano_github.config import settings
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -212,12 +215,19 @@ def _repository_label_names(owner: str, repo: str, token: str) -> dict[str, str]
     labels: dict[str, str] = {}
     page = 1
     while True:
-        page_labels = _request_json(
+        page_labels = _request_json_value(
             "GET",
             f"/repos/{_quote(owner)}/{_quote(repo)}/labels?per_page=100&page={page}",
             token=token,
         )
         if not isinstance(page_labels, list):
+            LOGGER.warning(
+                "GitHub labels response was malformed for %s/%s page %s: status=200 shape=%s",
+                owner,
+                repo,
+                page,
+                _json_shape(page_labels),
+            )
             raise GitHubAPIError(502, "GitHub labels response was malformed.")
         for label in page_labels:
             if not isinstance(label, dict) or not isinstance(label.get("name"), str):
@@ -343,6 +353,26 @@ def _request_json(
     token: str | None = None,
     app_auth: bool = False,
 ) -> dict[str, Any]:
+    data = _request_json_value(
+        method,
+        path,
+        payload=payload,
+        token=token,
+        app_auth=app_auth,
+    )
+    if not isinstance(data, dict):
+        raise GitHubAPIError(502, "GitHub returned an unexpected response.")
+    return data
+
+
+def _request_json_value(
+    method: str,
+    path: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    token: str | None = None,
+    app_auth: bool = False,
+) -> Any:
     url = _api_url(path)
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {
@@ -377,8 +407,6 @@ def _request_json(
     except json.JSONDecodeError as exc:
         raise GitHubAPIError(502, "GitHub returned malformed JSON.") from exc
 
-    if not isinstance(data, dict):
-        raise GitHubAPIError(502, "GitHub returned an unexpected response.")
     return data
 
 
@@ -457,3 +485,12 @@ def _error_message(exc: urllib.error.HTTPError) -> str:
 
     message = data.get("message") if isinstance(data, dict) else None
     return message if isinstance(message, str) and message else exc.reason
+
+
+def _json_shape(value: Any) -> str:
+    if isinstance(value, dict):
+        keys = ", ".join(sorted(str(key) for key in value.keys())[:8])
+        return f"object keys=[{keys}]"
+    if isinstance(value, list):
+        return f"list len={len(value)}"
+    return type(value).__name__

@@ -37,6 +37,7 @@ LOG_EVENT_TYPES = ("commits", "issues", "comments", "releases")
 LogEventType = Literal["commits", "issues", "comments", "releases"]
 WEBHOOK_PAYLOAD_URL = "https://api.nanoworks.co.uk/webhooks/github"
 WEBHOOK_EVENTS = "Pushes, Issues, Issue comments, Pull requests, Releases"
+LABEL_FETCH_WARNING = "GitHub labels could not be loaded. You can still create the issue without labels."
 DASHBOARD_ACCESS_MESSAGE = (
     "You need Administrator or Manage Server permission to use the Nano GitHub dashboard."
 )
@@ -399,7 +400,7 @@ class DashboardDefaultRepositorySelect(discord.ui.Select):
 
 class IssueRepositorySelect(discord.ui.Select):
     def __init__(self, parent: "IssueCreateView", linked_repos: list[LinkedRepository]) -> None:
-        self.parent = parent
+        self.issue_view = parent
         options = [
             discord.SelectOption(
                 label=f"{linked_repo.owner}/{linked_repo.repo}",
@@ -416,7 +417,7 @@ class IssueRepositorySelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if not self.parent.can_use(interaction):
+        if not self.issue_view.can_use(interaction):
             await interaction.response.send_message(
                 "Only the user who started this issue can use this menu.",
                 ephemeral=True,
@@ -428,7 +429,7 @@ class IssueRepositorySelect(discord.ui.Select):
             return
 
         db: Database = interaction.client.db  # type: ignore[attr-defined]
-        linked_repo = db.get_linked_repository(self.parent.guild_id, *selected_repo)
+        linked_repo = db.get_linked_repository(self.issue_view.guild_id, *selected_repo)
         if linked_repo is None:
             await interaction.response.send_message(
                 "That repository is not linked to this server.",
@@ -437,30 +438,37 @@ class IssueRepositorySelect(discord.ui.Select):
             return
 
         await interaction.response.defer()
+        label_result = await _fetch_repository_label_result(linked_repo.owner, linked_repo.repo)
         labels = _available_issue_labels(
-            self.parent.settings,
-            await _fetch_repository_labels(linked_repo.owner, linked_repo.repo),
+            self.issue_view.settings,
+            label_result[0],
         )
         view = IssueCreateView(
-            self.parent.guild_id,
-            self.parent.channel_id,
-            self.parent.user_id,
-            self.parent.title,
-            self.parent.description,
-            self.parent.settings,
-            self.parent.linked_repos,
+            self.issue_view.guild_id,
+            self.issue_view.channel_id,
+            self.issue_view.user_id,
+            self.issue_view.title,
+            self.issue_view.description,
+            self.issue_view.settings,
+            self.issue_view.linked_repos,
             linked_repo,
             labels,
+            label_warning=label_result[1],
         )
         await interaction.edit_original_response(
-            embed=_issue_create_prompt_embed(linked_repo, view.selected_labels, labels),
+            embed=_issue_create_prompt_embed(
+                linked_repo,
+                view.selected_labels,
+                labels,
+                label_warning=view.label_warning,
+            ),
             view=view,
         )
 
 
 class IssueLabelSelect(discord.ui.Select):
     def __init__(self, parent: "IssueCreateView", labels: tuple[str, ...]) -> None:
-        self.parent = parent
+        self.issue_view = parent
         defaults = {label.lower() for label in parent.selected_labels}
         options = [
             discord.SelectOption(
@@ -479,39 +487,43 @@ class IssueLabelSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if not self.parent.can_use(interaction):
+        if not self.issue_view.can_use(interaction):
             await interaction.response.send_message(
                 "Only the user who started this issue can use this menu.",
                 ephemeral=True,
             )
             return
-        self.parent.selected_labels = list(self.values)
+        self.issue_view.selected_labels = list(self.values)
         await interaction.response.defer()
 
 
 class IssueCreateButton(discord.ui.Button):
     def __init__(self, parent: "IssueCreateView") -> None:
         super().__init__(label="Create Issue", style=discord.ButtonStyle.success, row=1)
-        self.parent = parent
+        self.issue_view = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if not self.parent.can_use(interaction):
+        if not self.issue_view.can_use(interaction):
             await interaction.response.send_message(
                 "Only the user who started this issue can use this button.",
                 ephemeral=True,
             )
             return
-        if self.parent.linked_repo is None:
+        if self.issue_view.linked_repo is None:
             await interaction.response.send_message("Choose a repository first.", ephemeral=True)
             return
 
-        labels = self.parent.selected_labels or list(self.parent.settings.default_labels)
+        labels = (
+            []
+            if self.issue_view.label_warning
+            else self.issue_view.selected_labels or list(self.issue_view.settings.default_labels)
+        )
         await _create_issue_from_selection(
             interaction,
-            self.parent.channel_id,
-            self.parent.linked_repo,
-            self.parent.title,
-            self.parent.description,
+            self.issue_view.channel_id,
+            self.issue_view.linked_repo,
+            self.issue_view.title,
+            self.issue_view.description,
             labels,
         )
 
@@ -528,6 +540,7 @@ class IssueCreateView(discord.ui.View):
         linked_repos: list[LinkedRepository],
         linked_repo: LinkedRepository | None,
         labels: tuple[str, ...],
+        label_warning: bool = False,
     ) -> None:
         super().__init__(timeout=300)
         self.guild_id = guild_id
@@ -539,7 +552,8 @@ class IssueCreateView(discord.ui.View):
         self.linked_repos = linked_repos
         self.linked_repo = linked_repo
         self.labels = labels
-        self.selected_labels = _labels_available_in_repo(settings.default_labels, labels)
+        self.label_warning = label_warning
+        self.selected_labels = [] if label_warning else _labels_available_in_repo(settings.default_labels, labels)
 
         if linked_repo is None:
             self.add_item(IssueRepositorySelect(self, linked_repos))
@@ -1273,10 +1287,8 @@ async def create_issue(
         )
         return
 
-    repo_labels = _available_issue_labels(
-        settings,
-        await _fetch_repository_labels(linked_repo.owner, linked_repo.repo),
-    )
+    label_result = await _fetch_repository_label_result(linked_repo.owner, linked_repo.repo)
+    repo_labels = _available_issue_labels(settings, label_result[0])
     view = IssueCreateView(
         guild_id,
         int(interaction.channel_id),
@@ -1287,9 +1299,15 @@ async def create_issue(
         [linked_repo],
         linked_repo,
         repo_labels,
+        label_warning=label_result[1],
     )
     await interaction.response.send_message(
-        embed=_issue_create_prompt_embed(linked_repo, view.selected_labels, repo_labels),
+        embed=_issue_create_prompt_embed(
+            linked_repo,
+            view.selected_labels,
+            repo_labels,
+            label_warning=view.label_warning,
+        ),
         view=view,
         ephemeral=True,
     )
@@ -1583,21 +1601,38 @@ def _effective_issue_settings(db: Database, guild_id: int) -> IssueSettings:
 
 
 async def _fetch_repository_labels(owner: str, repo: str) -> tuple[str, ...]:
+    labels, _ = await _fetch_repository_label_result(owner, repo)
+    return labels
+
+
+async def _fetch_repository_label_result(owner: str, repo: str) -> tuple[tuple[str, ...], bool]:
     try:
-        return await asyncio.to_thread(list_repository_labels, owner, repo)
+        return await asyncio.to_thread(list_repository_labels, owner, repo), False
     except GitHubAppNotInstalled:
-        return ()
+        LOGGER.warning("GitHub App is not installed while fetching labels for %s/%s", owner, repo)
+        return (), True
     except GitHubAppNotConfigured:
-        return ()
-    except GitHubAPIError:
-        LOGGER.exception("Failed to fetch GitHub labels for %s/%s", owner, repo)
-        return ()
+        LOGGER.warning("GitHub App is not configured while fetching labels for %s/%s", owner, repo)
+        return (), True
+    except GitHubAPIError as exc:
+        LOGGER.warning(
+            "Failed to fetch GitHub labels for %s/%s: status=%s message=%s",
+            owner,
+            repo,
+            exc.status_code,
+            exc.message,
+        )
+        return (), True
+    except Exception:
+        LOGGER.exception("Unexpected error while fetching GitHub labels for %s/%s", owner, repo)
+        return (), True
 
 
 def _issue_create_prompt_embed(
     linked_repo: LinkedRepository,
     selected_labels: list[str],
     available_labels: tuple[str, ...],
+    label_warning: bool = False,
 ) -> discord.Embed:
     embed = discord.Embed(
         title="Create GitHub Issue",
@@ -1614,7 +1649,13 @@ def _issue_create_prompt_embed(
         value=_label_list_display(selected_labels),
         inline=False,
     )
-    if len(available_labels) > 25:
+    if label_warning:
+        embed.add_field(
+            name="Labels",
+            value=LABEL_FETCH_WARNING,
+            inline=False,
+        )
+    elif len(available_labels) > 25:
         embed.add_field(
             name="Label list",
             value="Showing the first 25 GitHub labels. Use slash-command autocomplete to search more.",
