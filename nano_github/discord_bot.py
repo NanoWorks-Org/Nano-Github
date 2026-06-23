@@ -306,7 +306,7 @@ class DashboardLogChannelSelect(discord.ui.ChannelSelect):
     def __init__(self, selected_log_type: str) -> None:
         self.selected_log_type = selected_log_type
         super().__init__(
-            placeholder=f"Set {_log_dashboard_type_label(selected_log_type).lower()}",
+            placeholder="Choose the channel Nano GitHub should use for this log type.",
             min_values=1,
             max_values=1,
             channel_types=[
@@ -327,7 +327,7 @@ class DashboardLogChannelSelect(discord.ui.ChannelSelect):
         channel = self.values[0] if self.values else None
         if not _is_sendable_log_channel(interaction, channel):
             await interaction.response.send_message(
-                "Choose a text channel where Nano GitHub can send messages and embeds.",
+                "Choose the channel Nano GitHub should use for this log type.",
                 ephemeral=True,
             )
             return
@@ -748,7 +748,7 @@ class DashboardConfigureLabelsButton(discord.ui.Button):
 class DashboardIssueSubmissionLogChannelSelect(discord.ui.ChannelSelect):
     def __init__(self) -> None:
         super().__init__(
-            placeholder="Set issue submission log channel",
+            placeholder="Choose the channel Nano GitHub should use for this log type.",
             min_values=1,
             max_values=1,
             channel_types=[
@@ -769,7 +769,7 @@ class DashboardIssueSubmissionLogChannelSelect(discord.ui.ChannelSelect):
         channel = self.values[0] if self.values else None
         if not _is_sendable_log_channel(interaction, channel):
             await interaction.response.send_message(
-                "Choose a text channel where Nano GitHub can send messages and embeds.",
+                "Choose the channel Nano GitHub should use for this log type.",
                 ephemeral=True,
             )
             return
@@ -2156,6 +2156,8 @@ async def _create_issue_from_selection(
             labels=created_issue.labels,
             repository=repository,
             submitted_by=submitted_by,
+            submitted_by_avatar_url=_user_avatar_url(interaction.user),
+            submitted_by_url=_discord_user_url(interaction.user),
             source_channel_id=source_channel_id,
             issue_url=created_issue.url,
         )
@@ -2477,6 +2479,16 @@ def _display_name(user: discord.abc.User) -> str:
     return getattr(user, "display_name", None) or getattr(user, "name", "Unknown user")
 
 
+def _user_avatar_url(user: discord.abc.User) -> str | None:
+    avatar = getattr(user, "display_avatar", None) or getattr(user, "avatar", None)
+    url = getattr(avatar, "url", None)
+    return url if isinstance(url, str) and url else None
+
+
+def _discord_user_url(user: discord.abc.User) -> str:
+    return f"https://discord.com/users/{user.id}"
+
+
 def _issue_status_embed(settings: IssueSettings | None) -> discord.Embed:
     embed = discord.Embed(title="Issue Creation Status", color=embeds.NANO_BLUE)
     if settings is None:
@@ -2527,6 +2539,8 @@ async def _send_issue_submission_log(
     labels: tuple[str, ...],
     repository: str,
     submitted_by: str,
+    submitted_by_avatar_url: str | None,
+    submitted_by_url: str | None,
     source_channel_id: int,
     issue_url: str,
 ) -> None:
@@ -2544,6 +2558,8 @@ async def _send_issue_submission_log(
         labels=labels,
         repository=repository,
         submitted_by=submitted_by,
+        submitted_by_avatar_url=submitted_by_avatar_url,
+        submitted_by_url=submitted_by_url,
         channel_id=source_channel_id,
         issue_url=issue_url,
     )

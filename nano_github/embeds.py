@@ -73,6 +73,7 @@ def _push_summary_message(payload: dict[str, Any], commit_count: int) -> EmbedMe
     if compare_url:
         embed.add_field(name="Compare", value=f"[View changes]({compare_url})", inline=False)
 
+    _apply_github_source(embed, payload, payload.get("pusher") or {})
     return EmbedMessage(embed=embed, view=_link_view("View Changes", compare_url))
 
 
@@ -96,6 +97,7 @@ def _branch_change_message(payload: dict[str, Any]) -> EmbedMessage:
         inline=True,
     )
 
+    _apply_github_source(embed, payload, payload.get("pusher") or {})
     return EmbedMessage(embed=embed, view=_link_view("View Changes", compare_url))
 
 
@@ -130,6 +132,7 @@ def _commit_message(payload: dict[str, Any], commit: dict[str, Any]) -> EmbedMes
     if thumbnail_url:
         embed.set_thumbnail(url=thumbnail_url)
 
+    _apply_github_source(embed, payload, author)
     return EmbedMessage(embed=embed, view=_link_view("View Commit", commit_url))
 
 
@@ -168,6 +171,7 @@ def issue_message(payload: dict[str, Any]) -> EmbedMessage:
     if avatar_url:
         embed.set_thumbnail(url=avatar_url)
 
+    _apply_github_source(embed, payload, issue.get("user") or {})
     return EmbedMessage(embed=embed, view=_link_view("View Issue", issue_url))
 
 
@@ -194,6 +198,7 @@ def issue_comment_embed(payload: dict[str, Any]) -> discord.Embed:
     if body:
         embed.description = _truncate(body, 700)
 
+    _apply_github_source(embed, payload, comment.get("user") or issue.get("user") or {})
     return embed
 
 
@@ -221,6 +226,7 @@ def release_embed(payload: dict[str, Any]) -> discord.Embed:
     if body:
         embed.description = _truncate(body, 700)
 
+    _apply_github_source(embed, payload, release.get("author") or {})
     return embed
 
 
@@ -268,7 +274,7 @@ def pull_request_embed(payload: dict[str, Any]) -> discord.Embed:
     if body:
         embed.description = _truncate(body, 700)
 
-    embed.set_footer(text="Nano GitHub PR review channel")
+    _apply_github_source(embed, payload, pr.get("user") or {})
     return embed
 
 
@@ -318,6 +324,8 @@ def issue_submission_log_embed(
     labels: tuple[str, ...],
     repository: str,
     submitted_by: str,
+    submitted_by_avatar_url: str | None = None,
+    submitted_by_url: str | None = None,
     channel_id: int,
     issue_url: str,
 ) -> discord.Embed:
@@ -332,6 +340,12 @@ def issue_submission_log_embed(
     embed.add_field(name="Submitted by", value=submitted_by, inline=True)
     embed.add_field(name="Channel", value=f"<#{channel_id}>", inline=True)
     embed.add_field(name="GitHub issue", value=f"[Open issue]({issue_url})", inline=False)
+    embed.set_author(
+        name=submitted_by,
+        url=submitted_by_url,
+        icon_url=submitted_by_avatar_url,
+    )
+    embed.set_footer(text=f"Sent from Discord • {submitted_by}")
     return embed
 
 
@@ -442,6 +456,43 @@ def _label_names(labels: tuple[str, ...]) -> str:
     if not labels:
         return "None"
     return _truncate(", ".join(f"`{label}`" for label in labels), 900)
+
+
+def _apply_github_source(
+    embed: discord.Embed,
+    payload: dict[str, Any],
+    fallback_actor: dict[str, Any] | None = None,
+) -> None:
+    actor = _github_actor(payload, fallback_actor)
+    name = actor["name"]
+    embed.set_author(
+        name=name,
+        url=actor["url"],
+        icon_url=actor["avatar_url"],
+    )
+    embed.set_footer(text=f"Sent from GitHub • {name}")
+
+
+def _github_actor(
+    payload: dict[str, Any],
+    fallback_actor: dict[str, Any] | None = None,
+) -> dict[str, str | None]:
+    sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+    fallback_actor = fallback_actor if isinstance(fallback_actor, dict) else {}
+
+    name = _string(sender.get("login")) or _string(
+        fallback_actor.get("login")
+        or fallback_actor.get("name")
+        or fallback_actor.get("username"),
+        "Unknown GitHub user",
+    )
+    avatar_url = _string(sender.get("avatar_url")) or _string(fallback_actor.get("avatar_url"))
+    html_url = _string(sender.get("html_url")) or _string(fallback_actor.get("html_url"))
+    return {
+        "name": name,
+        "avatar_url": avatar_url or None,
+        "url": html_url or None,
+    }
 
 
 def _commit_title_and_body(message: Any) -> tuple[str, str]:
