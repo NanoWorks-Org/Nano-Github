@@ -323,9 +323,13 @@ class DashboardLogChannelSelect(discord.ui.ChannelSelect):
         if guild_id is None:
             await interaction.response.send_message("Run this action in a server.", ephemeral=True)
             return
+        if self.selected_log_type not in LOG_DASHBOARD_TYPES:
+            await interaction.response.send_message("Choose a log type first.", ephemeral=True)
+            return
 
-        channel = self.values[0] if self.values else None
-        if not _is_sendable_log_channel(interaction, channel):
+        selected_channel = self.values[0] if self.values else None
+        channel = _resolve_selected_log_channel(interaction, selected_channel)
+        if channel is None or not _is_sendable_log_channel(interaction, channel):
             await interaction.response.send_message(
                 "Choose the channel Nano GitHub should use for this log type.",
                 ephemeral=True,
@@ -344,7 +348,7 @@ class DashboardLogChannelSelect(discord.ui.ChannelSelect):
             selected_log_type=self.selected_log_type,
         )
         await interaction.followup.send(
-            f"{_log_dashboard_type_label(self.selected_log_type)} set to {channel.mention}.",
+            f"Updated {_log_dashboard_type_label(self.selected_log_type)} log channel to {channel.mention}.",
             ephemeral=True,
         )
 
@@ -766,8 +770,9 @@ class DashboardIssueSubmissionLogChannelSelect(discord.ui.ChannelSelect):
             await interaction.response.send_message("Run this action in a server.", ephemeral=True)
             return
 
-        channel = self.values[0] if self.values else None
-        if not _is_sendable_log_channel(interaction, channel):
+        selected_channel = self.values[0] if self.values else None
+        channel = _resolve_selected_log_channel(interaction, selected_channel)
+        if channel is None or not _is_sendable_log_channel(interaction, channel):
             await interaction.response.send_message(
                 "Choose the channel Nano GitHub should use for this log type.",
                 ephemeral=True,
@@ -2152,10 +2157,12 @@ async def _create_issue_from_selection(
             interaction.client,  # type: ignore[arg-type]
             settings.submission_log_channel_id,
             issue_title=created_issue.title,
+            issue_description=description,
             issue_number=created_issue.number,
             labels=created_issue.labels,
             repository=repository,
             submitted_by=submitted_by,
+            submitted_by_username=_discord_username(interaction.user),
             submitted_by_avatar_url=_user_avatar_url(interaction.user),
             submitted_by_url=_discord_user_url(interaction.user),
             source_channel_id=source_channel_id,
@@ -2479,6 +2486,16 @@ def _display_name(user: discord.abc.User) -> str:
     return getattr(user, "display_name", None) or getattr(user, "name", "Unknown user")
 
 
+def _discord_username(user: discord.abc.User) -> str:
+    username = getattr(user, "name", None)
+    if isinstance(username, str) and username.strip():
+        return username.strip()
+    global_name = getattr(user, "global_name", None)
+    if isinstance(global_name, str) and global_name.strip():
+        return global_name.strip()
+    return _display_name(user)
+
+
 def _user_avatar_url(user: discord.abc.User) -> str | None:
     avatar = getattr(user, "display_avatar", None) or getattr(user, "avatar", None)
     url = getattr(avatar, "url", None)
@@ -2535,10 +2552,12 @@ async def _send_issue_submission_log(
     log_channel_id: int,
     *,
     issue_title: str,
+    issue_description: str,
     issue_number: int,
     labels: tuple[str, ...],
     repository: str,
     submitted_by: str,
+    submitted_by_username: str,
     submitted_by_avatar_url: str | None,
     submitted_by_url: str | None,
     source_channel_id: int,
@@ -2554,10 +2573,12 @@ async def _send_issue_submission_log(
 
     embed = embeds.issue_submission_log_embed(
         issue_title=issue_title,
+        issue_description=issue_description,
         issue_number=issue_number,
         labels=labels,
         repository=repository,
         submitted_by=submitted_by,
+        submitted_by_username=submitted_by_username,
         submitted_by_avatar_url=submitted_by_avatar_url,
         submitted_by_url=submitted_by_url,
         channel_id=source_channel_id,
@@ -3030,6 +3051,19 @@ def _is_sendable_log_channel(
         return False
     permissions = channel.permissions_for(bot_member)
     return permissions.view_channel and permissions.send_messages and permissions.embed_links
+
+
+def _resolve_selected_log_channel(
+    interaction: discord.Interaction,
+    selected_channel: object,
+) -> discord.TextChannel | None:
+    if isinstance(selected_channel, discord.TextChannel):
+        return selected_channel
+    channel_id = getattr(selected_channel, "id", None)
+    if channel_id is None or interaction.guild is None:
+        return None
+    channel = interaction.guild.get_channel(int(channel_id))
+    return channel if isinstance(channel, discord.TextChannel) else None
 
 
 def _issue_dashboard_summary(

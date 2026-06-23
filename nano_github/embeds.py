@@ -320,10 +320,12 @@ def issue_submission_success_embed(
 def issue_submission_log_embed(
     *,
     issue_title: str,
+    issue_description: str,
     issue_number: int,
     labels: tuple[str, ...],
     repository: str,
     submitted_by: str,
+    submitted_by_username: str,
     submitted_by_avatar_url: str | None = None,
     submitted_by_url: str | None = None,
     channel_id: int,
@@ -334,9 +336,21 @@ def issue_submission_log_embed(
         url=issue_url,
         color=NANO_DARK_BLUE,
     )
+    embed.description = _truncate(
+        "\n".join(
+            [
+                _string(issue_description, "No description provided."),
+                "",
+                "Submitted from Discord",
+                f"Discord username: {submitted_by_username}",
+            ]
+        ),
+        700,
+    )
     embed.add_field(name="Issue", value=f"#{issue_number}", inline=True)
     embed.add_field(name="Labels", value=_label_names(labels), inline=True)
     embed.add_field(name="Repository", value=f"`{repository}`", inline=True)
+    embed.add_field(name="State", value="open", inline=True)
     embed.add_field(name="Submitted by", value=submitted_by, inline=True)
     embed.add_field(name="Channel", value=f"<#{channel_id}>", inline=True)
     embed.add_field(name="GitHub issue", value=f"[Open issue]({issue_url})", inline=False)
@@ -345,7 +359,10 @@ def issue_submission_log_embed(
         url=submitted_by_url,
         icon_url=submitted_by_avatar_url,
     )
+    embed.set_footer(text=f"Sent from Discord • {submitted_by_username}")
     embed.set_footer(text=f"Sent from Discord • {submitted_by}")
+    embed.set_footer(text=f"Sent from Discord • {submitted_by_username}")
+    embed.set_footer(text=f"Sent from Discord \u2022 {submitted_by_username}")
     return embed
 
 
@@ -471,6 +488,7 @@ def _apply_github_source(
         icon_url=actor["avatar_url"],
     )
     embed.set_footer(text=f"Sent from GitHub • {name}")
+    embed.set_footer(text=f"Sent from GitHub \u2022 {name}")
 
 
 def _github_actor(
