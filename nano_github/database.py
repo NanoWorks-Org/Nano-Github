@@ -663,6 +663,18 @@ class Database:
             )
             return cursor.rowcount
 
+    def revoke_pending_setup_tokens(self, guild_id: int) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE github_setup_tokens
+                SET used_at = ?
+                WHERE guild_id = ? AND used_at IS NULL
+                """,
+                (_format_datetime(_utc_now()), guild_id),
+            )
+            return cursor.rowcount
+
     def rotate_webhook_secret(
         self,
         guild_id: int,
@@ -706,6 +718,110 @@ class Database:
                 (guild_id,),
             )
             return cursor.rowcount
+
+    def unlink_repository(self, guild_id: int, owner: str, repo: str) -> bool:
+        owner, repo = _normalize_repo(owner, repo)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM linked_repositories
+                WHERE guild_id = ? AND owner = ? AND repo = ?
+                """,
+                (guild_id, owner, repo),
+            )
+            self._connection.execute(
+                """
+                UPDATE issue_settings
+                SET
+                    default_owner = NULL,
+                    default_repo = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE guild_id = ? AND default_owner = ? AND default_repo = ?
+                """,
+                (guild_id, owner, repo),
+            )
+            return cursor.rowcount == 1
+
+    def disconnect_github_for_guild(self, guild_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM guild_installations WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM linked_repositories WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                """
+                UPDATE issue_settings
+                SET
+                    default_owner = NULL,
+                    default_repo = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM pr_messages WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                """
+                UPDATE github_setup_tokens
+                SET used_at = ?
+                WHERE guild_id = ? AND used_at IS NULL
+                """,
+                (_format_datetime(_utc_now()), guild_id),
+            )
+
+    def reset_guild_config(self, guild_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM guild_installations WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM linked_repositories WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM log_channels WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM pr_review_channels WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM pr_review_settings WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM issue_settings WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM issue_submissions WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM issue_role_rules WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM issue_blocked_roles WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM pr_messages WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM github_setup_tokens WHERE guild_id = ?",
+                (guild_id,),
+            )
 
     def set_log_channel(self, guild_id: int, event_type: str, channel_id: int) -> None:
         with self._lock, self._connection:

@@ -14,9 +14,13 @@ from nano_github import embeds
 from nano_github.config import Settings
 from nano_github.database import Database, LinkedRepository
 from nano_github.discord_bot import NanoGitHubBot, PullRequestReviewView
+from nano_github.github_callback_pages import (
+    render_install_error_html,
+    render_install_success_html,
+)
 from nano_github.github_setup import (
     SETUP_INVALID_TOKEN_MESSAGE,
-    complete_github_installation_setup,
+    complete_github_installation_setup_details,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -63,20 +67,23 @@ async def github_install_callback(
     setup_action: str | None = None,
 ) -> HTMLResponse:
     db: Database = request.app.state.db
-    success, message = complete_github_installation_setup(
+    result = complete_github_installation_setup_details(
         db,
         state,
         installation_id,
         setup_action,
     )
-    if not success and message != SETUP_INVALID_TOKEN_MESSAGE:
-        return _html_response(
-            message,
+    if not result.success and result.message != SETUP_INVALID_TOKEN_MESSAGE:
+        return HTMLResponse(
+            render_install_error_html(result.error_reason),
             status_code=status.HTTP_502_BAD_GATEWAY,
         )
-    if not success:
-        return _install_error_response()
-    return _html_response(message)
+    if not result.success:
+        return HTMLResponse(
+            render_install_error_html(result.error_reason),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    return HTMLResponse(render_install_success_html(result.account_login, result.installation_id))
 
 
 @router.post("/webhooks/github", status_code=status.HTTP_202_ACCEPTED)
@@ -199,23 +206,6 @@ async def github_webhook(
 
     await _dispatch_log_event(bot, db, guild_ids, log_event_type, messages)
     return {"accepted": True, "event": event, "guilds": len(guild_ids)}
-
-
-def _install_error_response() -> HTMLResponse:
-    return _html_response(
-        SETUP_INVALID_TOKEN_MESSAGE,
-        status_code=status.HTTP_400_BAD_REQUEST,
-    )
-
-
-def _html_response(message: str, status_code: int = status.HTTP_200_OK) -> HTMLResponse:
-    return HTMLResponse(
-        (
-            "<!doctype html><html><head><title>Nano GitHub</title></head>"
-            f"<body><p>{message}</p></body></html>"
-        ),
-        status_code=status_code,
-    )
 
 
 def _verified_repositories(

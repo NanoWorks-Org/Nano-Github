@@ -189,6 +189,100 @@ class RepositoryIsolationTests(unittest.TestCase):
         self.assertIsNone(linked_repo)
         self.assertEqual(error, NO_REPOSITORY_CONFIGURED_MESSAGE)
 
+    def test_revoke_setup_tokens_only_affects_current_guild(self) -> None:
+        token_a = self.db.create_github_setup_token(GUILD_A, 11)
+        token_b = self.db.create_github_setup_token(GUILD_B, 22)
+
+        self.db.revoke_pending_setup_tokens(GUILD_A)
+
+        self.assertIsNone(self.db.get_valid_github_setup_token(token_a))
+        self.assertIsNotNone(self.db.get_valid_github_setup_token(token_b))
+
+    def test_disconnect_github_only_removes_github_state_for_current_guild(self) -> None:
+        token_a = self.db.create_github_setup_token(GUILD_A, 11)
+        token_b = self.db.create_github_setup_token(GUILD_B, 22)
+        self.db.set_issue_default_repository(GUILD_A, "ownerA", "repoA")
+        self.db.set_issue_creation_enabled(GUILD_A, False)
+        self.db.set_log_channel(GUILD_A, "issues", 444)
+        self.db.set_pr_review_channel(GUILD_A, 555)
+        self.db.add_issue_blocked_role(GUILD_A, 666)
+
+        self.db.disconnect_github_for_guild(GUILD_A)
+
+        self.assertEqual(self.db.get_guild_installations(GUILD_A), [])
+        self.assertEqual(self.db.list_linked_repositories_for_guild(GUILD_A), [])
+        settings = self.db.get_issue_settings(GUILD_A)
+        self.assertIsNotNone(settings)
+        self.assertIsNone(settings.default_owner)  # type: ignore[union-attr]
+        self.assertIsNone(settings.default_repo)  # type: ignore[union-attr]
+        self.assertFalse(settings.enabled)  # type: ignore[union-attr]
+        self.assertEqual(self.db.get_log_channel(GUILD_A, "issues"), 444)
+        self.assertEqual(self.db.get_pr_review_channel(GUILD_A), 555)
+        self.assertEqual(self.db.get_issue_blocked_roles(GUILD_A), (666,))
+        self.assertIsNone(self.db.get_valid_github_setup_token(token_a))
+
+        self.assertEqual(
+            [item.installation_id for item in self.db.get_guild_installations(GUILD_B)],
+            [INSTALLATION_B],
+        )
+        self.assertEqual(
+            [
+                repo.repository_full_name
+                for repo in self.db.list_linked_repositories_for_guild(GUILD_B)
+            ],
+            [REPO_B],
+        )
+        self.assertIsNotNone(self.db.get_valid_github_setup_token(token_b))
+
+        linked_repo, error = resolve_issue_repository(self.db, GUILD_A, settings, None, None)
+        self.assertIsNone(linked_repo)
+        self.assertEqual(error, NO_REPOSITORY_CONFIGURED_MESSAGE)
+
+    def test_reset_guild_config_removes_all_current_guild_config(self) -> None:
+        token_a = self.db.create_github_setup_token(GUILD_A, 11)
+        token_b = self.db.create_github_setup_token(GUILD_B, 22)
+        self.db.set_issue_default_repository(GUILD_A, "ownerA", "repoA")
+        self.db.set_log_channel(GUILD_A, "issues", 444)
+        self.db.set_pr_review_channel(GUILD_A, 555)
+        self.db.add_issue_blocked_role(GUILD_A, 666)
+        self.db.upsert_pr_message(
+            GUILD_A,
+            "ownerA",
+            "repoA",
+            pr_number=7,
+            channel_id=123,
+            message_id=456,
+            state="open",
+        )
+
+        self.db.reset_guild_config(GUILD_A)
+
+        self.assertEqual(self.db.get_guild_installations(GUILD_A), [])
+        self.assertEqual(self.db.list_linked_repositories_for_guild(GUILD_A), [])
+        self.assertIsNone(self.db.get_issue_settings(GUILD_A))
+        self.assertIsNone(self.db.get_log_channel(GUILD_A, "issues"))
+        self.assertIsNone(self.db.get_pr_review_channel(GUILD_A))
+        self.assertEqual(self.db.get_issue_blocked_roles(GUILD_A), ())
+        self.assertIsNone(self.db.get_pr_message(GUILD_A, "ownerA", "repoA", 7))
+        self.assertIsNone(self.db.get_valid_github_setup_token(token_a))
+
+        self.assertEqual(
+            [item.installation_id for item in self.db.get_guild_installations(GUILD_B)],
+            [INSTALLATION_B],
+        )
+        self.assertEqual(
+            [
+                repo.repository_full_name
+                for repo in self.db.list_linked_repositories_for_guild(GUILD_B)
+            ],
+            [REPO_B],
+        )
+        self.assertIsNotNone(self.db.get_valid_github_setup_token(token_b))
+
+        linked_repo, error = resolve_issue_repository(self.db, GUILD_A, None, None, None)
+        self.assertIsNone(linked_repo)
+        self.assertEqual(error, NO_REPOSITORY_CONFIGURED_MESSAGE)
+
     def test_single_linked_repo_fallback_uses_guild_repo(self) -> None:
         linked_repo, error = resolve_issue_repository(self.db, GUILD_A, None, None, None)
 

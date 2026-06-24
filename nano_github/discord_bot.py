@@ -69,6 +69,7 @@ DASHBOARD_SECTIONS = {
     "issues": "Issue Creation",
     "github_app": "GitHub App",
     "webhook": "Webhook Info",
+    "security_reset": "Security & Reset",
 }
 
 
@@ -469,7 +470,7 @@ class DashboardInstalledRepositorySelect(discord.ui.Select):
                 )
             )
         super().__init__(
-            placeholder="Link an installed GitHub App repository",
+            placeholder="Link Repository",
             min_values=1,
             max_values=1,
             options=options,
@@ -508,6 +509,52 @@ class DashboardInstalledRepositorySelect(discord.ui.Select):
         default_message = " It is now the default repository." if default_set else ""
         await interaction.followup.send(
             f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server.{default_message}",
+            ephemeral=True,
+        )
+
+
+class DashboardUnlinkRepositorySelect(discord.ui.Select):
+    def __init__(self, linked_repos: list[LinkedRepository]) -> None:
+        options = [
+            discord.SelectOption(
+                label=f"{linked_repo.owner}/{linked_repo.repo}",
+                value=f"{linked_repo.owner}/{linked_repo.repo}",
+                description="Remove this repository from this Discord server",
+            )
+            for linked_repo in linked_repos[:25]
+        ]
+        super().__init__(
+            placeholder="Unlink Repository",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        selected_repo = _parse_repo_value(self.values[0])
+        if guild_id is None or selected_repo is None:
+            await interaction.response.send_message(
+                "Could not identify that repository.",
+                ephemeral=True,
+            )
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        if not db.unlink_repository(guild_id, selected_repo[0], selected_repo[1]):
+            await interaction.response.send_message(
+                "That repository is not linked to this server.",
+                ephemeral=True,
+            )
+            return
+
+        _clear_label_cache_for_guild(guild_id)
+        await _edit_dashboard(interaction, "repositories")
+        await interaction.followup.send(
+            f"Unlinked `{selected_repo[0]}/{selected_repo[1]}` from this server.",
             ephemeral=True,
         )
 
@@ -1024,6 +1071,174 @@ class DashboardRevealSecretButton(discord.ui.Button):
         )
 
 
+class DashboardRevokeSetupTokensButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(
+            label="Revoke Pending Setup Tokens",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        db.revoke_pending_setup_tokens(guild_id)
+        await _edit_dashboard(interaction, "security_reset")
+        await interaction.followup.send(
+            "Pending setup tokens for this server have been revoked.",
+            ephemeral=True,
+        )
+
+
+class DashboardDisconnectGitHubButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(
+            label="Disconnect GitHub",
+            style=discord.ButtonStyle.danger,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            (
+                "Disconnect GitHub from this Discord server?\n\n"
+                "This will remove connected GitHub App installations, linked repositories, "
+                "default repository, and cached labels for this server.\n\n"
+                "It will not remove Discord log settings or uninstall the GitHub App from GitHub."
+            ),
+            view=DashboardDestructiveConfirmationView(
+                guild_id,
+                action="disconnect",
+                dashboard_message=interaction.message,
+            ),
+            ephemeral=True,
+        )
+
+
+class DashboardResetGuildConfigButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(
+            label="Reset Server Config",
+            style=discord.ButtonStyle.danger,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            (
+                "Reset all Nano GitHub configuration for this Discord server?\n\n"
+                "This will remove all Nano GitHub settings for this server, including GitHub "
+                "connections, linked repositories, log channels, PR settings, issue creation "
+                "settings, blocked roles, labels, and setup tokens.\n\n"
+                "This cannot be undone."
+            ),
+            view=DashboardDestructiveConfirmationView(
+                guild_id,
+                action="reset",
+                dashboard_message=interaction.message,
+            ),
+            ephemeral=True,
+        )
+
+
+class DashboardDestructiveConfirmationView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        *,
+        action: Literal["disconnect", "reset"],
+        dashboard_message: discord.Message | None,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.action = action
+        self.dashboard_message = dashboard_message
+        self.add_item(DashboardConfirmDestructiveActionButton(action))
+        self.add_item(DashboardCancelDestructiveActionButton())
+
+
+class DashboardConfirmDestructiveActionButton(discord.ui.Button):
+    def __init__(self, action: Literal["disconnect", "reset"]) -> None:
+        super().__init__(
+            label=(
+                "Confirm Disconnect GitHub"
+                if action == "disconnect"
+                else "Confirm Reset Server Config"
+            ),
+            style=discord.ButtonStyle.danger,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, DashboardDestructiveConfirmationView):
+            await interaction.response.send_message(
+                "This confirmation has expired.",
+                ephemeral=True,
+            )
+            return
+        if not await _ensure_dashboard_access(interaction):
+            return
+        guild_id = _require_guild(interaction)
+        if guild_id is None or guild_id != view.guild_id:
+            await interaction.response.send_message(
+                "This dashboard control belongs to another server.",
+                ephemeral=True,
+            )
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        if view.action == "disconnect":
+            db.disconnect_github_for_guild(guild_id)
+            confirmation = (
+                "GitHub has been disconnected from this Discord server. Reconnect it from the "
+                "dashboard to use repositories again."
+            )
+        else:
+            db.reset_guild_config(guild_id)
+            confirmation = "Nano GitHub configuration for this Discord server has been reset."
+        _clear_label_cache_for_guild(guild_id)
+
+        await interaction.response.defer(ephemeral=True)
+        await _refresh_dashboard_message(interaction, view.dashboard_message)
+        await interaction.edit_original_response(content=confirmation, view=None)
+
+
+class DashboardCancelDestructiveActionButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(
+            label="Cancel",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content="No changes were made.",
+            view=None,
+        )
+
+
 class GitHubDashboardView(discord.ui.View):
     def __init__(
         self,
@@ -1052,13 +1267,17 @@ class GitHubDashboardView(discord.ui.View):
         log_channels = log_channels or {}
         self.add_item(DashboardNavigationSelect(section))
 
-        if section in {"overview", "repositories", "github_app"}:
+        if section == "overview" and not has_bound_installation:
+            self.add_item(DashboardConnectGitHubButton(has_bound_installation))
+        if section == "repositories":
             self.add_item(DashboardConnectGitHubButton(has_bound_installation))
         if section == "pr_reviews":
             self.add_item(DashboardReviewModeSelect(pr_review_mode))
         if section == "repositories":
             if installed_repos:
                 self.add_item(DashboardInstalledRepositorySelect(installed_repos, linked_repos))
+            if linked_repos:
+                self.add_item(DashboardUnlinkRepositorySelect(linked_repos))
         if section == "default_repo" and linked_repos:
             self.add_item(DashboardDefaultRepositorySelect(linked_repos, selected_repo))
         if section == "logs":
@@ -1093,6 +1312,10 @@ class GitHubDashboardView(discord.ui.View):
             if linked_repos:
                 self.add_item(DashboardRepositorySelect(linked_repos, selected_repo))
             self.add_item(DashboardRevealSecretButton(selected_repo))
+        if section == "security_reset":
+            self.add_item(DashboardRevokeSetupTokensButton())
+            self.add_item(DashboardDisconnectGitHubButton())
+            self.add_item(DashboardResetGuildConfigButton())
 
 
 class PullRequestReviewView(discord.ui.View):
@@ -2074,6 +2297,12 @@ def _label_cache_key(linked_repo: LinkedRepository) -> tuple[int, int | None, st
     )
 
 
+def _clear_label_cache_for_guild(guild_id: int) -> None:
+    for key in list(_LABEL_CACHE):
+        if key[0] == guild_id:
+            _LABEL_CACHE.pop(key, None)
+
+
 def _issue_create_prompt_embed(
     linked_repo: LinkedRepository,
     selected_labels: list[str],
@@ -2746,6 +2975,19 @@ async def _edit_dashboard(
     await interaction.edit_original_response(embed=embed, view=view)
 
 
+async def _refresh_dashboard_message(
+    interaction: discord.Interaction,
+    dashboard_message: discord.Message | None,
+) -> None:
+    if dashboard_message is None:
+        return
+    embed, view = await _build_dashboard(interaction, "overview")
+    try:
+        await dashboard_message.edit(embed=embed, view=view)
+    except discord.HTTPException:
+        LOGGER.exception("Failed to refresh dashboard after security action")
+
+
 async def _build_dashboard(
     interaction: discord.Interaction,
     section: str,
@@ -2869,18 +3111,13 @@ def _dashboard_embed(
         log_channels = {}
 
     if section == "overview":
-        embed.description = "Live server configuration and GitHub integration summary."
+        embed.description = "Server configuration and GitHub integration status."
         embed.add_field(
             name="GitHub App",
             value=_github_app_connection_summary(guild_installations),
             inline=False,
         )
         embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
-        embed.add_field(
-            name="Installed repositories for this Discord server",
-            value=_installed_repo_list(installed_repos, linked_repos, has_bound_installation),
-            inline=False,
-        )
         embed.add_field(
             name="Default repository",
             value=_default_repo_summary(linked_repos, default_repo),
@@ -2904,32 +3141,27 @@ def _dashboard_embed(
             value=_issue_dashboard_summary(issue_settings, issue_blocked_role_ids, guild),
             inline=False,
         )
-        embed.add_field(
-            name="GitHub App readiness",
-            value=_app_status_list(app_statuses, linked_repos),
-            inline=False,
-        )
-        embed.add_field(name="Webhook", value=_webhook_dashboard_summary(linked_repos), inline=False)
         embed.add_field(name="Bot/API", value=_bot_api_summary(bot_ready), inline=False)
         return embed
 
     if section == "repositories":
         embed.description = (
-            "Installed repositories are repositories the GitHub App installation can see. "
-            "Linked repositories are the repositories this Discord server is allowed to use."
+            "Manage GitHub App installations and the repositories this Discord server can use."
         )
-        embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
+        embed.add_field(
+            name="GitHub App installations",
+            value=_github_installation_list(guild_installations),
+            inline=False,
+        )
         embed.add_field(
             name="Installed repositories for this Discord server",
             value=_installed_repo_list(installed_repos, linked_repos, has_bound_installation),
             inline=False,
         )
+        embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
         embed.add_field(
-            name="Advanced",
-            value=(
-                "Use manual linking only for legacy webhook setups or before the first GitHub App "
-                "webhook delivery has taught Nano GitHub about the installation."
-            ),
+            name="Controls",
+            value=_repository_controls_summary(has_bound_installation, linked_repos),
             inline=False,
         )
         return embed
@@ -3055,6 +3287,38 @@ def _dashboard_embed(
         )
         return embed
 
+    if section == "security_reset":
+        embed.description = (
+            "Use these controls if the wrong GitHub account was connected, setup failed, "
+            "or you need to remove Nano GitHub access from this Discord server."
+        )
+        embed.add_field(
+            name="Revoke Pending Setup Tokens",
+            value=(
+                "Expires unused setup tokens for this server. Connected GitHub installations, "
+                "linked repositories, and Discord settings are not changed."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Disconnect GitHub",
+            value=(
+                "Removes GitHub App installation bindings, linked repositories, default "
+                "repository, cached labels, and pending setup tokens for this server. Discord "
+                "log settings, blocked roles, issue settings, and PR settings remain."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Reset Server Config",
+            value=(
+                "Removes all Nano GitHub configuration for this Discord server. This does not "
+                "uninstall the GitHub App from GitHub or delete GitHub data."
+            ),
+            inline=False,
+        )
+        return embed
+
     embed.description = "Choose a dashboard section from the menu."
     return embed
 
@@ -3109,6 +3373,34 @@ def _github_app_connection_summary(guild_installations: list[GuildInstallation])
             f"Account: `{account}`"
         )
     return _dashboard_value("\n\n".join(lines))
+
+
+def _github_installation_list(guild_installations: list[GuildInstallation]) -> str:
+    if not guild_installations:
+        return "No GitHub App installation connected to this Discord server."
+    lines = []
+    for installation in guild_installations:
+        account = installation.account_login or "unknown account"
+        lines.append(f"`{account}`: installation `{installation.installation_id}`")
+    return _dashboard_value("\n".join(lines))
+
+
+def _repository_controls_summary(
+    has_bound_installation: bool,
+    linked_repos: list[LinkedRepository],
+) -> str:
+    lines = [
+        (
+            "Connect another GitHub installation"
+            if has_bound_installation
+            else "Connect GitHub"
+        )
+    ]
+    if has_bound_installation:
+        lines.append("Link Repository")
+    if linked_repos:
+        lines.append("Unlink Repository")
+    return _dashboard_value("\n".join(lines))
 
 
 def _repo_list(linked_repos: list[LinkedRepository]) -> str:
