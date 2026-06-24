@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nano_github.config import settings
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -19,6 +17,14 @@ LOGGER = logging.getLogger(__name__)
 class GitHubInstallation:
     id: int
     account_login: str | None = None
+    account_type: str | None = None
+
+
+@dataclass(frozen=True)
+class GitHubRepository:
+    owner: str
+    repo: str
+    repository_full_name: str
 
 
 @dataclass(frozen=True)
@@ -113,7 +119,70 @@ def get_installation_for_repo(owner: str, repo: str) -> GitHubInstallation | Non
     return GitHubInstallation(
         id=installation_id,
         account_login=account_login if isinstance(account_login, str) else None,
+        account_type=None,
     )
+
+
+def get_installation(installation_id: int) -> GitHubInstallation:
+    data = _request_json(
+        "GET",
+        f"/app/installations/{installation_id}",
+        app_auth=True,
+    )
+    returned_installation_id = data.get("id")
+    if not isinstance(returned_installation_id, int):
+        raise GitHubAPIError(502, "GitHub installation response did not include an id.")
+
+    account = data.get("account") or {}
+    account_login = account.get("login") if isinstance(account, dict) else None
+    account_type = account.get("type") if isinstance(account, dict) else None
+    return GitHubInstallation(
+        id=returned_installation_id,
+        account_login=account_login if isinstance(account_login, str) else None,
+        account_type=account_type if isinstance(account_type, str) else None,
+    )
+
+
+def list_installation_repositories(installation_id: int) -> tuple[GitHubRepository, ...]:
+    access = _create_installation_access(installation_id)
+    repositories: list[GitHubRepository] = []
+    page = 1
+    while True:
+        data = _request_json_value(
+            "GET",
+            f"/installation/repositories?per_page=100&page={page}",
+            token=access.token,
+        )
+        if not isinstance(data, dict):
+            raise GitHubAPIError(502, "GitHub installation repositories response was malformed.")
+        repo_items = data.get("repositories")
+        if not isinstance(repo_items, list):
+            raise GitHubAPIError(502, "GitHub installation repositories response was malformed.")
+
+        for item in repo_items:
+            if not isinstance(item, dict):
+                continue
+            full_name = item.get("full_name")
+            name = item.get("name")
+            owner_login = (item.get("owner") or {}).get("login")
+            if isinstance(full_name, str) and "/" in full_name:
+                owner_from_full, repo_from_full = full_name.split("/", 1)
+                owner_login = owner_login or owner_from_full
+                name = name or repo_from_full
+            if not isinstance(owner_login, str) or not isinstance(name, str):
+                continue
+            owner, repo = _normalize_repo(owner_login, name)
+            repositories.append(
+                GitHubRepository(
+                    owner=owner,
+                    repo=repo,
+                    repository_full_name=(full_name or f"{owner}/{repo}").strip().lower(),
+                )
+            )
+
+        if len(repo_items) < 100:
+            return tuple(repositories)
+        page += 1
 
 
 def create_issue(
@@ -409,6 +478,7 @@ def _request_json_value(
 
 
 def _github_app_jwt() -> str:
+    settings = _settings()
     app_id = settings.github_app_id
     private_key = _private_key()
     if not app_id or not private_key:
@@ -433,6 +503,7 @@ def _github_app_jwt() -> str:
 
 
 def _private_key() -> str | None:
+    settings = _settings()
     if settings.github_app_private_key:
         return settings.github_app_private_key.replace("\\n", "\n")
     if settings.github_app_private_key_path:
@@ -441,8 +512,15 @@ def _private_key() -> str | None:
 
 
 def _api_url(path: str) -> str:
+    settings = _settings()
     base_url = settings.github_api_base_url.rstrip("/")
     return f"{base_url}/{path.lstrip('/')}"
+
+
+def _settings() -> Any:
+    from nano_github.config import settings
+
+    return settings
 
 
 def _quote(value: str) -> str:

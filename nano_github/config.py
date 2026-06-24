@@ -10,8 +10,10 @@ class Settings(BaseSettings):
     github_app_webhook_secret: str | None = None
     github_api_base_url: str = "https://api.github.com"
     github_app_id: str | None = None
+    github_app_slug: str = "nano-github-transfer"
     github_app_private_key: str | None = None
     github_app_private_key_path: str | None = None
+    public_base_url: str = "https://api.nanoworks.co.uk"
     api_host: str = "0.0.0.0"
     api_port: int = 8080
     database_url: str | None = None

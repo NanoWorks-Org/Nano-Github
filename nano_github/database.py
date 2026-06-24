@@ -6,6 +6,7 @@ import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,16 @@ class GuildInstallation:
     account_login: str | None
     account_type: str | None
     created_at: str
+
+
+@dataclass(frozen=True)
+class GitHubSetupToken:
+    token: str
+    guild_id: int
+    user_id: int
+    created_at: str
+    expires_at: str
+    used_at: str | None
 
 
 class RepositoryNotLinkedToGuild(ValueError):
@@ -182,6 +193,19 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_guild_installations_installation
                     ON guild_installations(installation_id, guild_id);
 
+                CREATE TABLE IF NOT EXISTS github_setup_tokens (
+                    token TEXT PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_github_setup_tokens_guild
+                    ON github_setup_tokens(guild_id, expires_at);
+
                 CREATE TABLE IF NOT EXISTS log_channels (
                     guild_id INTEGER NOT NULL,
                     event_type TEXT NOT NULL,
@@ -288,6 +312,7 @@ class Database:
             self._ensure_webhook_secret_column()
             self._ensure_installation_columns()
             self._ensure_guild_installations_table()
+            self._ensure_github_setup_tokens_table()
             self._ensure_pr_message_review_columns()
             self._ensure_issue_settings_label_columns()
             self._ensure_issue_blocked_roles_table()
@@ -558,6 +583,85 @@ class Database:
             installation_id,
         ):
             raise InstallationNotBoundToGuild(guild_id, installation_id)
+
+    def create_github_setup_token(self, guild_id: int, user_id: int) -> str:
+        created_at = _utc_now()
+        expires_at = created_at + timedelta(minutes=10)
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)",
+                (guild_id,),
+            )
+            while True:
+                token = _generate_setup_token()
+                try:
+                    self._connection.execute(
+                        """
+                        INSERT INTO github_setup_tokens (
+                            token,
+                            guild_id,
+                            user_id,
+                            created_at,
+                            expires_at
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            token,
+                            guild_id,
+                            user_id,
+                            _format_datetime(created_at),
+                            _format_datetime(expires_at),
+                        ),
+                    )
+                    return token
+                except sqlite3.IntegrityError:
+                    continue
+
+    def get_valid_github_setup_token(self, token: str) -> GitHubSetupToken | None:
+        token = token.strip()
+        if not token:
+            return None
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT token, guild_id, user_id, created_at, expires_at, used_at
+                FROM github_setup_tokens
+                WHERE token = ?
+                """,
+                (token,),
+            ).fetchone()
+        if row is None:
+            return None
+        setup_token = _github_setup_token_from_row(row)
+        if setup_token.used_at is not None:
+            return None
+        if _parse_datetime(setup_token.expires_at) <= _utc_now():
+            return None
+        return setup_token
+
+    def mark_github_setup_token_used(self, token: str) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE github_setup_tokens
+                SET used_at = ?
+                WHERE token = ? AND used_at IS NULL
+                """,
+                (_format_datetime(_utc_now()), token.strip()),
+            )
+            return cursor.rowcount == 1
+
+    def cleanup_expired_github_setup_tokens(self) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM github_setup_tokens
+                WHERE expires_at <= ? OR used_at IS NOT NULL
+                """,
+                (_format_datetime(_utc_now()),),
+            )
+            return cursor.rowcount
 
     def rotate_webhook_secret(
         self,
@@ -1478,6 +1582,27 @@ class Database:
             """
         )
 
+    def _ensure_github_setup_tokens_table(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS github_setup_tokens (
+                token TEXT PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_github_setup_tokens_guild
+                ON github_setup_tokens(guild_id, expires_at)
+            """
+        )
+
     def _ensure_pr_message_review_columns(self) -> None:
         columns = {
             row["name"]
@@ -1559,6 +1684,25 @@ def _generate_webhook_secret() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _generate_setup_token() -> str:
+    return f"NW-{secrets.token_hex(8).upper()}"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _format_datetime(value: datetime) -> str:
+    return value.astimezone(UTC).replace(microsecond=0).isoformat()
+
+
+def _parse_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _linked_repository_from_row(row: sqlite3.Row) -> LinkedRepository:
     installation_id = row["installation_id"]
     return LinkedRepository(
@@ -1587,6 +1731,17 @@ def _guild_installation_from_row(row: sqlite3.Row) -> GuildInstallation:
         account_login=row["account_login"],
         account_type=row["account_type"],
         created_at=row["created_at"],
+    )
+
+
+def _github_setup_token_from_row(row: sqlite3.Row) -> GitHubSetupToken:
+    return GitHubSetupToken(
+        token=row["token"],
+        guild_id=int(row["guild_id"]),
+        user_id=int(row["user_id"]),
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        used_at=row["used_at"],
     )
 
 

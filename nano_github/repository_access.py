@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from nano_github.database import (
     Database,
+    InstalledRepository,
     InstallationNotBoundToGuild,
     IssueSettings,
     LinkedRepository,
@@ -56,3 +57,27 @@ def resolve_issue_repository(
     if len(linked_repos) > 1:
         return None, "Multiple repositories linked. Please specify owner and repo."
     return None, NO_REPOSITORY_CONFIGURED_MESSAGE
+
+
+def link_installed_repository_to_guild(
+    db: Database,
+    guild_id: int,
+    installed_repo: InstalledRepository,
+) -> tuple[LinkedRepository, bool]:
+    existing_linked_repos = [
+        repo
+        for repo in db.list_linked_repositories_for_guild(guild_id)
+        if repo.installation_id is not None
+        and db.is_installation_bound_to_guild(guild_id, repo.installation_id)
+    ]
+    linked_repo = db.link_repository(
+        guild_id,
+        installed_repo.owner,
+        installed_repo.repo,
+        installation_id=installed_repo.installation_id,
+        repository_full_name=installed_repo.repository_full_name,
+    )
+    default_set = not existing_linked_repos
+    if default_set:
+        db.set_issue_default_repository(guild_id, linked_repo.owner, linked_repo.repo)
+    return linked_repo, default_set

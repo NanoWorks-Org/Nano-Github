@@ -5,17 +5,20 @@ from datetime import datetime, timezone
 import logging
 import time
 from typing import Literal
+from urllib.parse import quote
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from nano_github import embeds
+from nano_github.config import settings as app_settings
 from nano_github.database import (
     REVIEW_MODE_ANYONE,
     REVIEW_MODE_DISCORD_ROLE,
     REVIEW_MODE_GITHUB_REVIEWERS,
     Database,
+    GuildInstallation,
     InstalledRepository,
     InstallationNotBoundToGuild,
     IssueSettings,
@@ -37,6 +40,7 @@ from nano_github.repository_access import (
     INSTALLATION_NOT_BOUND_MESSAGE,
     NO_REPOSITORY_CONFIGURED_MESSAGE,
     REPOSITORY_NOT_LINKED_MESSAGE,
+    link_installed_repository_to_guild,
     resolve_issue_repository,
 )
 
@@ -488,12 +492,10 @@ class DashboardInstalledRepositorySelect(discord.ui.Select):
         db: Database = interaction.client.db  # type: ignore[attr-defined]
         db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
         try:
-            linked_repo = db.link_repository(
+            linked_repo, default_set = link_installed_repository_to_guild(
+                db,
                 guild_id,
-                installed_repo.owner,
-                installed_repo.repo,
-                installation_id=installed_repo.installation_id,
-                repository_full_name=installed_repo.repository_full_name,
+                installed_repo,
             )
         except InstallationNotBoundToGuild:
             await interaction.response.send_message(
@@ -501,11 +503,11 @@ class DashboardInstalledRepositorySelect(discord.ui.Select):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message(
-            (
-                f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server. "
-                "Use `/github dashboard` to choose channels and defaults."
-            ),
+
+        await _edit_dashboard(interaction, "repositories")
+        default_message = " It is now the default repository." if default_set else ""
+        await interaction.followup.send(
+            f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server.{default_message}",
             ephemeral=True,
         )
 
@@ -771,6 +773,42 @@ class DashboardLinkRepositoryButton(discord.ui.Button):
         await interaction.response.send_modal(LinkRepositoryModal())
 
 
+class DashboardConnectGitHubButton(discord.ui.Button):
+    def __init__(self, has_bound_installation: bool) -> None:
+        super().__init__(
+            label=(
+                "Connect another GitHub installation"
+                if has_bound_installation
+                else "Connect GitHub"
+            ),
+            style=discord.ButtonStyle.primary,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        guild_id = _require_guild(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("Run this action in a server.", ephemeral=True)
+            return
+        if not await _ensure_manage_guild(interaction):
+            return
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
+        token = db.create_github_setup_token(guild_id, interaction.user.id)
+        install_url = _github_app_install_url(token)
+        await interaction.response.send_message(
+            (
+                "Connect Nano GitHub to GitHub\n\n"
+                f"Guild ID: `{guild_id}`\n"
+                f"Setup Token: `{token}`\n\n"
+                "Click the link below to install the GitHub App:\n"
+                f"{install_url}"
+            ),
+            ephemeral=True,
+        )
+
+
 class DashboardConfigureLabelsButton(discord.ui.Button):
     def __init__(self) -> None:
         super().__init__(
@@ -1002,6 +1040,7 @@ class GitHubDashboardView(discord.ui.View):
         issue_blocked_role_ids: tuple[int, ...] = (),
         log_channels: dict[str, int] | None = None,
         pr_review_channel_id: int | None = None,
+        has_bound_installation: bool = False,
     ) -> None:
         super().__init__(timeout=300)
         self.guild_id = guild_id
@@ -1013,16 +1052,15 @@ class GitHubDashboardView(discord.ui.View):
         log_channels = log_channels or {}
         self.add_item(DashboardNavigationSelect(section))
 
+        if section in {"overview", "repositories", "github_app"}:
+            self.add_item(DashboardConnectGitHubButton(has_bound_installation))
         if section == "pr_reviews":
             self.add_item(DashboardReviewModeSelect(pr_review_mode))
         if section == "repositories":
             if installed_repos:
                 self.add_item(DashboardInstalledRepositorySelect(installed_repos, linked_repos))
-            self.add_item(DashboardLinkRepositoryButton())
         if section == "default_repo" and linked_repos:
             self.add_item(DashboardDefaultRepositorySelect(linked_repos, selected_repo))
-        if section == "default_repo":
-            self.add_item(DashboardLinkRepositoryButton())
         if section == "logs":
             configured_channel_id = (
                 pr_review_channel_id
@@ -1177,6 +1215,12 @@ def _require_guild(interaction: discord.Interaction) -> int | None:
     if interaction.guild_id is None:
         return None
     return int(interaction.guild_id)
+
+
+def _github_app_install_url(token: str) -> str:
+    slug = quote(app_settings.github_app_slug.strip(), safe="")
+    state = quote(token, safe="")
+    return f"https://github.com/apps/{slug}/installations/new?state={state}"
 
 
 async def _ensure_manage_guild(interaction: discord.Interaction) -> bool:
@@ -2757,6 +2801,7 @@ async def _build_dashboard(
         config=config,
         linked_repos=linked_repos,
         installed_repos=installed_repos,
+        guild_installations=guild_installations,
         issue_settings=issue_settings,
         issue_blocked_role_ids=issue_blocked_role_ids,
         selected_log_type=selected_log_type,
@@ -2790,6 +2835,7 @@ async def _build_dashboard(
         pr_review_channel_id=int(config["pr_review_channel"])
         if config["pr_review_channel"]
         else None,
+        has_bound_installation=bool(guild_installations),
     )
     return embed, view
 
@@ -2800,6 +2846,7 @@ def _dashboard_embed(
     config: dict[str, object],
     linked_repos: list[LinkedRepository],
     installed_repos: list[InstalledRepository],
+    guild_installations: list[GuildInstallation],
     issue_settings: IssueSettings | None,
     issue_blocked_role_ids: tuple[int, ...],
     selected_log_type: str,
@@ -2823,6 +2870,11 @@ def _dashboard_embed(
 
     if section == "overview":
         embed.description = "Live server configuration and GitHub integration summary."
+        embed.add_field(
+            name="GitHub App",
+            value=_github_app_connection_summary(guild_installations),
+            inline=False,
+        )
         embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
         embed.add_field(
             name="Installed repositories for this Discord server",
@@ -2957,9 +3009,11 @@ def _dashboard_embed(
         return embed
 
     if section == "github_app":
-        embed.description = (
-            "Live GitHub App checks for repositories linked to this Discord server. "
-            "Installed repositories listed here are informational until linked."
+        embed.description = "GitHub App connection for this Discord server."
+        embed.add_field(
+            name="Status",
+            value=_github_app_connection_summary(guild_installations),
+            inline=False,
         )
         embed.add_field(
             name="Installed repositories for this Discord server",
@@ -3039,6 +3093,22 @@ async def _github_app_statuses(
 
     pairs = await asyncio.gather(*(check(linked_repo) for linked_repo in linked_repos))
     return dict(pairs)
+
+
+def _github_app_connection_summary(guild_installations: list[GuildInstallation]) -> str:
+    if not guild_installations:
+        return (
+            "Status: Not connected\n\n"
+            "No GitHub App installation connected to this Discord server."
+        )
+    lines = ["Status: Connected"]
+    for installation in guild_installations:
+        account = installation.account_login or "unknown account"
+        lines.append(
+            f"Installation ID: `{installation.installation_id}`\n"
+            f"Account: `{account}`"
+        )
+    return _dashboard_value("\n\n".join(lines))
 
 
 def _repo_list(linked_repos: list[LinkedRepository]) -> str:
