@@ -1,7 +1,5 @@
 # Nano GitHub
 
-Bring GitHub directly into your Discord server.
-
 Nano GitHub allows your community, development team, or staff team to track repository activity, review pull requests, and manage GitHub integrations without leaving Discord.
 
 ---
