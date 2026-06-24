@@ -1,585 +1,318 @@
 # Nano GitHub
 
-A Discord bot that connects GitHub repositories directly to Discord.
+Bring GitHub directly into your Discord server.
 
-Nano GitHub provides:
-
-- Commit logging
-- Issue logging
-- Pull request logging
-- Release logging
-- Comment logging
-- Interactive pull request reviews from Discord
-- GitHub App integration
-- Multi-server support
-- Webhook security verification
-- Dashboard integration
+Nano GitHub allows your community, development team, or staff team to track repository activity, review pull requests, and manage GitHub integrations without leaving Discord.
 
 ---
 
-# Features
+## Features
 
-## GitHub Activity Logging
+### GitHub Activity Logging
 
-Automatically send GitHub events into Discord channels.
+Automatically receive Discord notifications for:
 
-Supported events:
-
-- Pushes / Commits
-- Issues
-- Issue Comments
-- Pull Requests
-- Pull Request Reviews
-- Pull Request Review Comments
-- Releases
+* Commits
+* Pull Requests
+* Pull Request Reviews
+* Issues
+* Issue Comments
+* Releases
 
 ---
 
-## Pull Request Review System
+### Pull Request Reviews
 
-When a pull request is opened:
+Review pull requests directly from Discord.
 
-- A review embed is posted in Discord
-- Reviewers can:
-  - View PR
-  - Approve
-  - Request Changes
+Team members can:
 
-Responses are sent back to GitHub using the installed GitHub App.
+* View pull requests
+* Approve pull requests
+* Request changes
 
----
-
-## GitHub App Integration
-
-Nano GitHub uses a GitHub App instead of personal access tokens.
-
-Benefits:
-
-- More secure
-- Repository-scoped permissions
-- Easier setup
-- Supports multiple repositories
+Actions are synced back to GitHub automatically.
 
 ---
 
-## Dashboard
+### Issue Creation
 
-The dashboard provides:
+Allow Discord users to submit GitHub issues without opening GitHub.
 
-- Linked repositories
-- Installed repositories
-- Default repository
-- Log channels
-- PR review settings
-- GitHub App readiness checks
+Perfect for:
 
----
-
-# Requirements
-
-## Discord
-
-- Discord Server
-- Manage Server permission
-- Ability to invite bots
-
-## GitHub
-
-- GitHub organisation or repository
-- Permission to install GitHub Apps
-
-## Hosting
-
-- Docker & Docker Compose recommended
-
-or
-
-- Python 3.11+
+* Suggestions
+* Bug reports
+* Community feedback
 
 ---
 
-# Installation
+### Multiple Repositories
 
-## Option 1 – Docker (Recommended)
+Link multiple repositories to a single Discord server.
 
-### Clone Repository
-
-```bash
-git clone https://github.com/nanoworks-org/nano-github.git
-cd nano-github
-```
+Choose a default repository for commands and issue submissions.
 
 ---
 
-### Create Environment File
+## Getting Started
 
-Create:
+### Step 1 — Invite Nano GitHub
 
-```env
-DISCORD_TOKEN=
-CLIENT_ID=
-GUILD_ID=
+Invite Nano GitHub to your Discord server.
 
-GITHUB_APP_ID=
-GITHUB_CLIENT_ID=
-GITHUB_CLIENT_SECRET=
-GITHUB_WEBHOOK_SECRET=
+The bot requires:
 
-PRIVATE_KEY_PATH=/app/private-key.pem
+* View Channels
+* Send Messages
+* Embed Links
+* Read Message History
+* Use Slash Commands
 
-DATABASE_PATH=/app/data/nano_github.db
-
-WEB_HOST=0.0.0.0
-WEB_PORT=8080
-PUBLIC_URL=https://your-domain.com
-```
+Administrator permission is not required.
 
 ---
 
-### Add GitHub App Private Key
-
-Place:
-
-```text
-private-key.pem
-```
-
-inside the project directory.
-
----
-
-### Start
-
-```bash
-docker compose up -d --build
-```
-
-Check logs:
-
-```bash
-docker logs -f nano-github
-```
-
----
-
-# GitHub App Setup
-
-## Create GitHub App
-
-Create a GitHub App with:
-
-### Permissions
-
-Repository Permissions:
-
-| Permission | Access |
-|------------|---------|
-| Contents | Read |
-| Pull Requests | Read & Write |
-| Issues | Read & Write |
-| Metadata | Read |
-| Commit Statuses | Read |
-| Actions | Read |
-
----
-
-### Webhook Events
-
-Enable:
-
-- Push
-- Pull Request
-- Pull Request Review
-- Pull Request Review Comment
-- Issues
-- Issue Comment
-- Release
-
----
-
-### Webhook URL
-
-```text
-https://your-domain.com/github/webhook
-```
-
----
-
-### Callback URL
-
-```text
-https://your-domain.com/github/install/callback
-```
-
----
-
-# Discord Setup
-
-Invite the bot using:
-
-```text
-applications.commands
-bot
-```
-
-Recommended permissions:
-
-- View Channels
-- Send Messages
-- Embed Links
-- Attach Files
-- Read Message History
-- Use Slash Commands
-
-Administrator is NOT required.
-
----
-
-# First-Time Setup
-
-## 1. Install GitHub App
+### Step 2 — Connect GitHub
 
 Run:
 
-```text
 /github connect
-```
 
-Install the GitHub App when prompted.
+Nano GitHub will provide a secure GitHub installation link.
+
+Install the Nano GitHub App onto:
+
+* Your personal account
+* Your organisation
+* Selected repositories
 
 ---
 
-## 2. Link Repository
+### Step 3 — Link a Repository
 
-```text
+Run:
+
 /github repo add owner/repository
-```
 
 Example:
 
-```text
 /github repo add nanoworks-org/nano-github
-```
 
 ---
 
-## 3. Set Default Repository
+### Step 4 — Set a Default Repository
 
-```text
+Run:
+
 /github repo default owner/repository
-```
 
 Example:
 
-```text
 /github repo default nanoworks-org/nano-github
-```
+
+This repository will be used for issue creation and other repository-specific features.
 
 ---
 
-## 4. Configure Log Channels
+## Setting Up Logs
 
-Example:
+You can choose separate channels for each event type.
 
-```text
+### Commit Logs
+
 /github logs commits #github-logs
+
+---
+
+### Issue Logs
+
 /github logs issues #github-logs
+
+---
+
+### Comment Logs
+
+/github logs comments #github-logs
+
+---
+
+### Release Logs
+
 /github logs releases #github-logs
-```
 
 ---
 
-# Commands
+### Pull Request Logs
 
-## General
-
-### Dashboard
-
-```text
-/github dashboard
-```
-
-Shows:
-
-- Linked repositories
-- Log channels
-- PR settings
-- Installation status
+/github logs pullrequests #github-logs
 
 ---
 
-### Status
+## Pull Request Reviews
 
-```text
-/github status
-```
+### Set Review Channel
 
-Shows GitHub connectivity and health.
+/github pr channel #pull-request-reviews
 
----
-
-# Repository Commands
-
-## Add Repository
-
-```text
-/github repo add owner/repository
-```
-
-Example:
-
-```text
-/github repo add nanoworks-org/nano-github
-```
+Whenever a pull request is opened, Nano GitHub will post an interactive review card.
 
 ---
 
-## Remove Repository
+### Restrict Reviews
 
-```text
-/github repo remove owner/repository
-```
-
----
-
-## List Repositories
-
-```text
-/github repo list
-```
-
----
-
-## Set Default Repository
-
-```text
-/github repo default owner/repository
-```
-
----
-
-# Logging Commands
-
-## Commit Logs
-
-```text
-/github logs commits #channel
-```
-
----
-
-## Issue Logs
-
-```text
-/github logs issues #channel
-```
-
----
-
-## Comment Logs
-
-```text
-/github logs comments #channel
-```
-
----
-
-## Release Logs
-
-```text
-/github logs releases #channel
-```
-
----
-
-## Pull Request Logs
-
-```text
-/github logs pullrequests #channel
-```
-
----
-
-# Pull Request Review Commands
-
-## Configure Review Channel
-
-```text
-/github pr channel #reviews
-```
-
----
-
-## Restrict Reviews to Discord Role
-
-```text
 /github pr role @Developers
-```
 
-Only members with the role can approve or request changes.
+Only members with this role will be able to:
+
+* Approve pull requests
+* Request changes
 
 ---
 
-## Disable Role Restriction
+### Remove Restrictions
 
-```text
 /github pr role disable
-```
+
+Anyone with access to the review channel may review pull requests.
 
 ---
 
-# Issue Creation
+## Issue Creation
 
-## Enable
+### Enable Issue Creation
 
-```text
 /github issues enable
-```
-
-Allows users to create GitHub issues from Discord.
 
 ---
 
-## Disable
+### Disable Issue Creation
 
-```text
 /github issues disable
-```
 
 ---
 
-## Set Submission Log
+### Configure Submission Logs
 
-```text
 /github issues log #github-submissions
-```
+
+All issue submissions will be logged for staff review.
 
 ---
 
-# Example Workflow
+## Commands
 
-## Developer Opens Pull Request
+### General
 
-GitHub:
+/github dashboard
 
-```text
-feature/login-system
-→ main
-```
+View:
 
----
-
-## Discord Receives Embed
-
-```text
-PR #42
-Add login system
-
-Author:
-DuckQuack001
-
-Repository:
-nanoworks-org/nano-github
-```
-
-Buttons:
-
-- View PR
-- Approve
-- Request Changes
+* Connected repositories
+* Installed repositories
+* Log channels
+* Review settings
+* Issue settings
 
 ---
 
-## Reviewer Approves
-
-Discord reviewer presses:
-
-```text
-Approve
-```
-
-Nano GitHub:
-
-- Creates GitHub review
-- Updates PR
-- Logs action
-
----
-
-# Security
-
-Nano GitHub includes:
-
-- GitHub webhook signature verification
-- GitHub App authentication
-- Repository ownership validation
-- Role-restricted reviews
-- SQLite persistence
-- Audit logging
-
----
-
-# Troubleshooting
-
-## GitHub App Not Connected
-
-Check:
-
-```text
 /github status
-```
 
-Verify:
-
-- App installed
-- App permissions granted
-- Webhook URL reachable
+Check GitHub connection status.
 
 ---
 
-## No Events Arriving
+### Repository Management
 
-Check:
+/github repo add owner/repository
 
-1. GitHub App installed on repository
-2. Webhook deliveries successful
-3. Bot online
-4. Log channels configured
+/github repo remove owner/repository
 
----
+/github repo list
 
-## Review Buttons Not Working
-
-Check:
-
-- GitHub App permissions
-- PR review role restrictions
-- Repository linked correctly
+/github repo default owner/repository
 
 ---
 
-# Resetting Nano GitHub
+### Logging
 
-If credentials are compromised:
+/github logs commits #channel
 
-1. Revoke GitHub App installation.
-2. Generate a new private key.
-3. Regenerate webhook secret.
-4. Update `.env`.
-5. Restart Nano GitHub.
-6. Reinstall the GitHub App.
+/github logs issues #channel
+
+/github logs comments #channel
+
+/github logs releases #channel
+
+/github logs pullrequests #channel
+
+---
+
+### Pull Requests
+
+/github pr channel #channel
+
+/github pr role @role
+
+/github pr role disable
 
 ---
 
-# Nano Works
+### Issues
 
-Nano GitHub is part of the Nano Works ecosystem.
+/github issues enable
 
-Additional services currently in development:
+/github issues disable
 
-- Nano Community
-- Nano Server
-- Nano Dashboard
+/github issues log #channel
 
 ---
-© Nano Works
+
+## Frequently Asked Questions
+
+### Does Nano GitHub need Administrator permission?
+
+No.
+
+Only the permissions required to send messages, embeds, and slash commands are needed.
+
+---
+
+### Can I connect multiple repositories?
+
+Yes.
+
+You can link multiple repositories and choose a default repository.
+
+---
+
+### Can I limit who reviews pull requests?
+
+Yes.
+
+Use role restrictions to allow only approved reviewers.
+
+---
+
+### Why are no GitHub events appearing?
+
+Check that:
+
+* The GitHub App is installed
+* The repository is linked
+* Log channels are configured
+* The bot can send messages in the selected channels
+
+---
+
+## Support
+
+If you encounter issues, use:
+
+/github status
+
+to check your current configuration and GitHub App status.
+
+---
+
+Nano GitHub • Built by Nano Works
