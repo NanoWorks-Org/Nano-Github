@@ -122,16 +122,16 @@ def create_issue(
     title: str,
     body: str,
     labels: list[str] | None = None,
+    installation_id: int | None = None,
 ) -> CreatedIssue:
     owner, repo = _normalize_repo(owner, repo)
     labels = [label.strip() for label in labels or [] if label.strip()]
     LOGGER.debug("Preparing GitHub issue labels for %s/%s: %s", owner, repo, labels)
 
-    installation = get_installation_for_repo(owner, repo)
-    if installation is None:
+    if installation_id is None:
         raise GitHubAppNotInstalled()
 
-    access = _create_installation_access(installation.id)
+    access = _create_installation_access(installation_id)
     _require_permission(
         access.permissions,
         "issues",
@@ -186,13 +186,16 @@ def create_issue(
     )
 
 
-def list_repository_labels(owner: str, repo: str) -> tuple[str, ...]:
+def list_repository_labels(
+    owner: str,
+    repo: str,
+    installation_id: int | None = None,
+) -> tuple[str, ...]:
     owner, repo = _normalize_repo(owner, repo)
-    installation = get_installation_for_repo(owner, repo)
-    if installation is None:
+    if installation_id is None:
         raise GitHubAppNotInstalled()
 
-    access = _create_installation_access(installation.id)
+    access = _create_installation_access(installation_id)
     return tuple(_repository_label_names(owner, repo, access.token).values())
 
 
@@ -231,17 +234,17 @@ def submit_pull_request_review(
     pull_number: int,
     event: str,
     body: str | None = None,
+    installation_id: int | None = None,
 ) -> SubmittedPullRequestReview:
     owner, repo = _normalize_repo(owner, repo)
     event = event.strip().upper()
     if event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
         raise ValueError(f"Unsupported pull request review event: {event}")
 
-    installation = get_installation_for_repo(owner, repo)
-    if installation is None:
+    if installation_id is None:
         raise GitHubAppNotInstalled()
 
-    access = _create_installation_access(installation.id)
+    access = _create_installation_access(installation_id)
     _require_permission(
         access.permissions,
         "pull_requests",
@@ -278,10 +281,13 @@ def submit_pull_request_review(
     )
 
 
-def check_repository_permissions(owner: str, repo: str) -> RepositoryPermissionCheck:
+def check_repository_permissions(
+    owner: str,
+    repo: str,
+    installation_id: int | None = None,
+) -> RepositoryPermissionCheck:
     owner, repo = _normalize_repo(owner, repo)
-    installation = get_installation_for_repo(owner, repo)
-    if installation is None:
+    if installation_id is None:
         return RepositoryPermissionCheck(
             owner=owner,
             repo=repo,
@@ -293,14 +299,14 @@ def check_repository_permissions(owner: str, repo: str) -> RepositoryPermissionC
             can_review_pull_requests=False,
         )
 
-    access = _create_installation_access(installation.id)
+    access = _create_installation_access(installation_id)
     issues = access.permissions.get("issues")
     pull_requests = access.permissions.get("pull_requests")
     return RepositoryPermissionCheck(
         owner=owner,
         repo=repo,
         installed=True,
-        installation_id=installation.id,
+        installation_id=installation_id,
         issues=issues,
         pull_requests=pull_requests,
         can_create_issues=_permission_at_least(issues, "write"),

@@ -40,6 +40,33 @@ class InstalledRepository:
 
 
 @dataclass(frozen=True)
+class GuildInstallation:
+    guild_id: int
+    installation_id: int
+    account_login: str | None
+    account_type: str | None
+    created_at: str
+
+
+class RepositoryNotLinkedToGuild(ValueError):
+    def __init__(self, guild_id: int, repo_full_name: str) -> None:
+        self.guild_id = guild_id
+        self.repo_full_name = repo_full_name
+        super().__init__(
+            f"{repo_full_name.strip().lower()} is not linked to Discord guild {guild_id}."
+        )
+
+
+class InstallationNotBoundToGuild(ValueError):
+    def __init__(self, guild_id: int, installation_id: int | None) -> None:
+        self.guild_id = guild_id
+        self.installation_id = installation_id
+        super().__init__(
+            f"GitHub App installation {installation_id} is not bound to Discord guild {guild_id}."
+        )
+
+
+@dataclass(frozen=True)
 class PrMessage:
     guild_id: int
     owner: str
@@ -141,6 +168,19 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_installed_repositories_repo
                     ON installed_repositories(owner, repo);
+
+                CREATE TABLE IF NOT EXISTS guild_installations (
+                    guild_id INTEGER NOT NULL,
+                    installation_id INTEGER NOT NULL,
+                    account_login TEXT,
+                    account_type TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, installation_id),
+                    FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_guild_installations_installation
+                    ON guild_installations(installation_id, guild_id);
 
                 CREATE TABLE IF NOT EXISTS log_channels (
                     guild_id INTEGER NOT NULL,
@@ -247,6 +287,7 @@ class Database:
             )
             self._ensure_webhook_secret_column()
             self._ensure_installation_columns()
+            self._ensure_guild_installations_table()
             self._ensure_pr_message_review_columns()
             self._ensure_issue_settings_label_columns()
             self._ensure_issue_blocked_roles_table()
@@ -273,6 +314,8 @@ class Database:
         repository_full_name: str | None = None,
     ) -> LinkedRepository:
         owner, repo = _normalize_repo(owner, repo)
+        if installation_id is not None:
+            self.assert_installation_bound_to_guild(guild_id, installation_id)
         if repository_full_name is None:
             repository_full_name = f"{owner}/{repo}"
         webhook_secret = _generate_webhook_secret()
@@ -366,6 +409,29 @@ class Database:
 
         return _linked_repository_from_row(row) if row else None
 
+    def get_guild_linked_repository(
+        self,
+        guild_id: int,
+        repo_full_name: str,
+    ) -> LinkedRepository | None:
+        owner, repo = _normalize_repo_full_name(repo_full_name)
+        if owner is None or repo is None:
+            return None
+        return self.get_linked_repository(guild_id, owner, repo)
+
+    def assert_repo_linked_to_guild(
+        self,
+        guild_id: int,
+        repo_full_name: str,
+    ) -> LinkedRepository:
+        linked_repo = self.get_guild_linked_repository(guild_id, repo_full_name)
+        if linked_repo is None:
+            raise RepositoryNotLinkedToGuild(guild_id, repo_full_name)
+        if linked_repo.installation_id is None:
+            raise InstallationNotBoundToGuild(guild_id, None)
+        self.assert_installation_bound_to_guild(guild_id, linked_repo.installation_id)
+        return linked_repo
+
     def list_linked_repositories_for_guild(self, guild_id: int) -> list[LinkedRepository]:
         with self._lock:
             rows = self._connection.execute(
@@ -384,6 +450,114 @@ class Database:
                 (guild_id,),
             ).fetchall()
         return [_linked_repository_from_row(row) for row in rows]
+
+    def add_guild_installation(
+        self,
+        guild_id: int,
+        installation_id: int,
+        account_login: str | None = None,
+        account_type: str | None = None,
+    ) -> GuildInstallation:
+        account_login = (
+            account_login.strip().lower()
+            if account_login and account_login.strip()
+            else None
+        )
+        account_type = (
+            account_type.strip().lower()
+            if account_type and account_type.strip()
+            else None
+        )
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)",
+                (guild_id,),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO guild_installations (
+                    guild_id,
+                    installation_id,
+                    account_login,
+                    account_type
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, installation_id) DO UPDATE SET
+                    account_login = excluded.account_login,
+                    account_type = excluded.account_type
+                """,
+                (guild_id, installation_id, account_login, account_type),
+            )
+            row = self._connection.execute(
+                """
+                SELECT guild_id, installation_id, account_login, account_type, created_at
+                FROM guild_installations
+                WHERE guild_id = ? AND installation_id = ?
+                """,
+                (guild_id, installation_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Failed to bind GitHub installation to guild")
+        return _guild_installation_from_row(row)
+
+    def remove_guild_installation(self, guild_id: int, installation_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                DELETE FROM guild_installations
+                WHERE guild_id = ? AND installation_id = ?
+                """,
+                (guild_id, installation_id),
+            )
+
+    def get_guild_installations(self, guild_id: int) -> list[GuildInstallation]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, installation_id, account_login, account_type, created_at
+                FROM guild_installations
+                WHERE guild_id = ?
+                ORDER BY installation_id
+                """,
+                (guild_id,),
+            ).fetchall()
+        return [_guild_installation_from_row(row) for row in rows]
+
+    def get_guilds_for_installation(self, installation_id: int) -> list[int]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id
+                FROM guild_installations
+                WHERE installation_id = ?
+                ORDER BY guild_id
+                """,
+                (installation_id,),
+            ).fetchall()
+        return [int(row["guild_id"]) for row in rows]
+
+    def is_installation_bound_to_guild(self, guild_id: int, installation_id: int) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1
+                FROM guild_installations
+                WHERE guild_id = ? AND installation_id = ?
+                """,
+                (guild_id, installation_id),
+            ).fetchone()
+        return row is not None
+
+    def assert_installation_bound_to_guild(
+        self,
+        guild_id: int,
+        installation_id: int | None,
+    ) -> None:
+        if installation_id is None or not self.is_installation_bound_to_guild(
+            guild_id,
+            installation_id,
+        ):
+            raise InstallationNotBoundToGuild(guild_id, installation_id)
 
     def rotate_webhook_secret(
         self,
@@ -540,16 +714,19 @@ class Database:
             rows = self._connection.execute(
                 """
                 SELECT
-                    guild_id,
-                    owner,
-                    repo,
-                    webhook_secret,
-                    installation_id,
-                    repository_full_name
+                    linked_repositories.guild_id,
+                    linked_repositories.owner,
+                    linked_repositories.repo,
+                    linked_repositories.webhook_secret,
+                    linked_repositories.installation_id,
+                    linked_repositories.repository_full_name
                 FROM linked_repositories
-                WHERE owner = ? AND repo = ?
-                    AND (installation_id IS NULL OR installation_id = ?)
-                ORDER BY guild_id
+                INNER JOIN guild_installations
+                    ON guild_installations.guild_id = linked_repositories.guild_id
+                    AND guild_installations.installation_id = linked_repositories.installation_id
+                WHERE linked_repositories.owner = ? AND linked_repositories.repo = ?
+                    AND linked_repositories.installation_id = ?
+                ORDER BY linked_repositories.guild_id
                 """,
                 (owner, repo, installation_id),
             ).fetchall()
@@ -587,9 +764,22 @@ class Database:
                     installation_id = ?,
                     repository_full_name = ?
                 WHERE owner = ? AND repo = ?
-                    AND (installation_id IS NULL OR installation_id = ?)
+                    AND installation_id = ?
+                    AND EXISTS (
+                        SELECT 1
+                        FROM guild_installations
+                        WHERE guild_installations.guild_id = linked_repositories.guild_id
+                            AND guild_installations.installation_id = ?
+                    )
                 """,
-                (installation_id, repository_full_name, owner, repo, installation_id),
+                (
+                    installation_id,
+                    repository_full_name,
+                    owner,
+                    repo,
+                    installation_id,
+                    installation_id,
+                ),
             )
         return InstalledRepository(installation_id, owner, repo, repository_full_name)
 
@@ -601,6 +791,26 @@ class Database:
                 FROM installed_repositories
                 ORDER BY owner, repo
                 """
+            ).fetchall()
+        return [_installed_repository_from_row(row) for row in rows]
+
+    def list_installed_repositories_for_guild(self, guild_id: int) -> list[InstalledRepository]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT
+                    installed_repositories.installation_id,
+                    installed_repositories.owner,
+                    installed_repositories.repo,
+                    installed_repositories.repository_full_name
+                FROM installed_repositories
+                INNER JOIN guild_installations
+                    ON guild_installations.installation_id =
+                        installed_repositories.installation_id
+                WHERE guild_installations.guild_id = ?
+                ORDER BY installed_repositories.owner, installed_repositories.repo
+                """,
+                (guild_id,),
             ).fetchall()
         return [_installed_repository_from_row(row) for row in rows]
 
@@ -838,6 +1048,7 @@ class Database:
         submission_log_channel_id: int | None = None,
     ) -> IssueSettings:
         default_owner, default_repo = _normalize_repo(default_owner, default_repo)
+        self.assert_repo_linked_to_guild(guild_id, f"{default_owner}/{default_repo}")
         suggestion_label = _normalize_label(suggestion_label, "suggestion")
         bug_label = _normalize_label(bug_label, "bug")
         allowed_labels_json = json.dumps(_normalize_label_list(allowed_labels or []))
@@ -1238,6 +1449,35 @@ class Database:
             """
         )
 
+    def _ensure_guild_installations_table(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_installations (
+                guild_id INTEGER NOT NULL,
+                installation_id INTEGER NOT NULL,
+                account_login TEXT,
+                account_type TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, installation_id),
+                FOREIGN KEY (guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_guild_installations_installation
+                ON guild_installations(installation_id, guild_id)
+            """
+        )
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO guild_installations (guild_id, installation_id)
+            SELECT DISTINCT guild_id, installation_id
+            FROM linked_repositories
+            WHERE installation_id IS NOT NULL
+            """
+        )
+
     def _ensure_pr_message_review_columns(self) -> None:
         columns = {
             row["name"]
@@ -1281,6 +1521,16 @@ class Database:
 
 def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:
     return owner.strip().lower(), repo.strip().lower()
+
+
+def _normalize_repo_full_name(repo_full_name: str) -> tuple[str | None, str | None]:
+    if "/" not in repo_full_name:
+        return None, None
+    owner, repo = repo_full_name.split("/", 1)
+    owner, repo = _normalize_repo(owner, repo)
+    if not owner or not repo:
+        return None, None
+    return owner, repo
 
 
 def _normalize_label(value: str | None, fallback: str) -> str:
@@ -1327,6 +1577,16 @@ def _installed_repository_from_row(row: sqlite3.Row) -> InstalledRepository:
         owner=row["owner"],
         repo=row["repo"],
         repository_full_name=row["repository_full_name"],
+    )
+
+
+def _guild_installation_from_row(row: sqlite3.Row) -> GuildInstallation:
+    return GuildInstallation(
+        guild_id=int(row["guild_id"]),
+        installation_id=int(row["installation_id"]),
+        account_login=row["account_login"],
+        account_type=row["account_type"],
+        created_at=row["created_at"],
     )
 
 

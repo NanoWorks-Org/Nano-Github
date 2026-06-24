@@ -17,9 +17,11 @@ from nano_github.database import (
     REVIEW_MODE_GITHUB_REVIEWERS,
     Database,
     InstalledRepository,
+    InstallationNotBoundToGuild,
     IssueSettings,
     LinkedRepository,
     PrMessage,
+    RepositoryNotLinkedToGuild,
 )
 from nano_github.github_client import (
     GitHubAPIError,
@@ -31,6 +33,12 @@ from nano_github.github_client import (
     list_repository_labels,
     submit_pull_request_review,
 )
+from nano_github.repository_access import (
+    INSTALLATION_NOT_BOUND_MESSAGE,
+    NO_REPOSITORY_CONFIGURED_MESSAGE,
+    REPOSITORY_NOT_LINKED_MESSAGE,
+    resolve_issue_repository,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,13 +47,15 @@ LogEventType = Literal["commits", "issues", "comments", "releases"]
 LOG_DASHBOARD_TYPES = (*LOG_EVENT_TYPES, "pr_reviews")
 WEBHOOK_PAYLOAD_URL = "https://api.nanoworks.co.uk/webhooks/github"
 WEBHOOK_EVENTS = "Pushes, Issues, Issue comments, Pull requests, Releases"
-LABEL_FETCH_WARNING = "GitHub labels could not be loaded. You can still create the issue without labels."
+LABEL_FETCH_WARNING = (
+    "GitHub labels could not be loaded. You can still create the issue without labels."
+)
 DASHBOARD_ACCESS_MESSAGE = (
     "You need Administrator or Manage Server permission to use the Nano GitHub dashboard."
 )
 ISSUE_CREATION_BLOCKED_MESSAGE = "You are not allowed to create GitHub issues from Discord."
 LABEL_CACHE_TTL_SECONDS = 300
-_LABEL_CACHE: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
+_LABEL_CACHE: dict[tuple[int, int | None, str, str], tuple[float, tuple[str, ...]]] = {}
 DASHBOARD_SECTIONS = {
     "overview": "Overview",
     "repositories": "Repositories",
@@ -141,8 +151,24 @@ class IssueLabelsModal(discord.ui.Modal, title="Configure Issue Labels"):
         db: Database = interaction.client.db  # type: ignore[attr-defined]
         settings = db.get_issue_settings(self.guild_id)
         default_repo = _configured_default_repo(settings)
+        if default_repo is not None:
+            try:
+                db.assert_repo_linked_to_guild(
+                    self.guild_id,
+                    f"{default_repo[0]}/{default_repo[1]}",
+                )
+            except (RepositoryNotLinkedToGuild, InstallationNotBoundToGuild):
+                default_repo = None
         if default_repo is None:
-            linked_repos = db.list_linked_repositories_for_guild(self.guild_id)
+            linked_repos = [
+                linked_repo
+                for linked_repo in db.list_linked_repositories_for_guild(self.guild_id)
+                if linked_repo.installation_id is not None
+                and db.is_installation_bound_to_guild(
+                    self.guild_id,
+                    linked_repo.installation_id,
+                )
+            ]
             if len(linked_repos) == 1:
                 default_repo = (linked_repos[0].owner, linked_repos[0].repo)
         if default_repo is None:
@@ -193,11 +219,10 @@ class LinkRepositoryModal(discord.ui.Modal, title="Link Repository"):
 
         db: Database = interaction.client.db  # type: ignore[attr-defined]
         db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
-        linked_repo = db.link_repository(guild_id, str(self.owner.value), str(self.repo.value))
         await interaction.response.send_message(
             (
-                f"Linked `{linked_repo.owner}/{linked_repo.repo}`. "
-                "Use `/github dashboard` to choose channels and review GitHub App status."
+                "Manual repository linking is disabled until a GitHub App installation is "
+                "connected to this Discord server."
             ),
             ephemeral=True,
         )
@@ -432,7 +457,11 @@ class DashboardInstalledRepositorySelect(discord.ui.Select):
                 discord.SelectOption(
                     label=installed_repo.repository_full_name[:100],
                     value=value,
-                    description="Linked" if (installed_repo.owner, installed_repo.repo) in linked else "Available",
+                    description=(
+                        "Linked to this Discord server"
+                        if (installed_repo.owner, installed_repo.repo) in linked
+                        else "Available to this Discord server"
+                    ),
                 )
             )
         super().__init__(
@@ -458,13 +487,20 @@ class DashboardInstalledRepositorySelect(discord.ui.Select):
 
         db: Database = interaction.client.db  # type: ignore[attr-defined]
         db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
-        linked_repo = db.link_repository(
-            guild_id,
-            installed_repo.owner,
-            installed_repo.repo,
-            installation_id=installed_repo.installation_id,
-            repository_full_name=installed_repo.repository_full_name,
-        )
+        try:
+            linked_repo = db.link_repository(
+                guild_id,
+                installed_repo.owner,
+                installed_repo.repo,
+                installation_id=installed_repo.installation_id,
+                repository_full_name=installed_repo.repository_full_name,
+            )
+        except InstallationNotBoundToGuild:
+            await interaction.response.send_message(
+                INSTALLATION_NOT_BOUND_MESSAGE,
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_message(
             (
                 f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server. "
@@ -506,12 +542,16 @@ class DashboardDefaultRepositorySelect(discord.ui.Select):
             return
 
         db: Database = interaction.client.db  # type: ignore[attr-defined]
-        linked_repo = db.get_linked_repository(guild_id, *selected_repo)
-        if linked_repo is None:
-            await interaction.response.send_message(
-                "That repository is not linked to this server.",
-                ephemeral=True,
+        try:
+            linked_repo = db.assert_repo_linked_to_guild(
+                guild_id,
+                f"{selected_repo[0]}/{selected_repo[1]}",
             )
+        except RepositoryNotLinkedToGuild:
+            await _send_repo_not_linked_message(interaction)
+            return
+        except InstallationNotBoundToGuild:
+            await _send_installation_not_bound_message(interaction)
             return
         db.set_issue_default_repository(guild_id, linked_repo.owner, linked_repo.repo)
         await _edit_dashboard(interaction, "default_repo", selected_repo)
@@ -550,16 +590,20 @@ class IssueRepositorySelect(discord.ui.Select):
             return
 
         db: Database = interaction.client.db  # type: ignore[attr-defined]
-        linked_repo = db.get_linked_repository(self.issue_view.guild_id, *selected_repo)
-        if linked_repo is None:
-            await interaction.response.send_message(
-                "That repository is not linked to this server.",
-                ephemeral=True,
+        try:
+            linked_repo = db.assert_repo_linked_to_guild(
+                self.issue_view.guild_id,
+                f"{selected_repo[0]}/{selected_repo[1]}",
             )
+        except RepositoryNotLinkedToGuild:
+            await _send_repo_not_linked_message(interaction)
+            return
+        except InstallationNotBoundToGuild:
+            await _send_installation_not_bound_message(interaction)
             return
 
         await interaction.response.defer()
-        label_result = await _fetch_repository_label_result(linked_repo.owner, linked_repo.repo)
+        label_result = await _fetch_repository_label_result(linked_repo)
         labels = _available_issue_labels(
             self.issue_view.settings,
             label_result[0],
@@ -1183,16 +1227,13 @@ async def link_repo(interaction: discord.Interaction, owner: str, repo: str) -> 
     if not await _ensure_manage_guild(interaction):
         return
 
-    db: Database = interaction.client.db  # type: ignore[attr-defined]
-    db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
-    linked_repo = db.link_repository(guild_id, owner, repo)
-    await interaction.response.send_message(
-        (
-            f"Linked `{linked_repo.owner}/{linked_repo.repo}` to this server. "
-            "Use `/github dashboard` to choose channels and review GitHub App status."
-        ),
-        ephemeral=True,
-    )
+        await interaction.response.send_message(
+            (
+                "Manual repository linking is disabled until a GitHub App installation is "
+                "connected to this Discord server."
+            ),
+            ephemeral=True,
+        )
 
 
 @app_commands.describe(owner="GitHub repository owner or organization", repo="GitHub repository name")
@@ -1357,12 +1398,13 @@ async def app_status(interaction: discord.Interaction, owner: str, repo: str) ->
         return
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
-    linked_repo = db.get_linked_repository(guild_id, owner, repo)
-    if linked_repo is None:
-        await interaction.response.send_message(
-            f"`{owner.strip().lower()}/{repo.strip().lower()}` is not linked to this server.",
-            ephemeral=True,
-        )
+    try:
+        linked_repo = db.assert_repo_linked_to_guild(guild_id, f"{owner}/{repo}")
+    except RepositoryNotLinkedToGuild:
+        await _send_repo_not_linked_message(interaction)
+        return
+    except InstallationNotBoundToGuild:
+        await _send_installation_not_bound_message(interaction)
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -1371,6 +1413,7 @@ async def app_status(interaction: discord.Interaction, owner: str, repo: str) ->
             check_repository_permissions,
             linked_repo.owner,
             linked_repo.repo,
+            linked_repo.installation_id,
         )
     except GitHubAppNotConfigured:
         await interaction.followup.send(
@@ -1505,7 +1548,7 @@ async def issue_labels_autocomplete(
     if settings.allowed_labels:
         labels = settings.allowed_labels
     else:
-        labels = await _fetch_repository_labels(linked_repo.owner, linked_repo.repo)
+        labels = await _fetch_repository_labels(linked_repo)
     query = current.rsplit(",", 1)[-1].strip().lower()
     prefix = current[: len(current) - len(current.rsplit(",", 1)[-1])]
     matches = [label for label in labels if not query or query in label.lower()]
@@ -1580,7 +1623,7 @@ async def create_issue(
         return
     if linked_repo is None:
         await interaction.response.send_message(
-            "No default repository configured.",
+            NO_REPOSITORY_CONFIGURED_MESSAGE,
             ephemeral=True,
         )
         return
@@ -1604,7 +1647,7 @@ async def create_issue(
         )
         return
 
-    label_result = await _fetch_repository_label_result(linked_repo.owner, linked_repo.repo)
+    label_result = await _fetch_repository_label_result(linked_repo)
     repo_labels = _available_issue_labels(settings, label_result[0])
     view = IssueCreateView(
         guild_id,
@@ -1658,15 +1701,16 @@ async def configure_issue_creation(
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
     db.upsert_guild(guild_id, interaction.guild.name if interaction.guild else None)
-    linked_repo = db.get_linked_repository(guild_id, default_repo_owner, default_repo_name)
-    if linked_repo is None:
-        await interaction.response.send_message(
-            (
-                f"`{default_repo_owner.strip().lower()}/"
-                f"{default_repo_name.strip().lower()}` is not linked to this server."
-            ),
-            ephemeral=True,
+    try:
+        linked_repo = db.assert_repo_linked_to_guild(
+            guild_id,
+            f"{default_repo_owner}/{default_repo_name}",
         )
+    except RepositoryNotLinkedToGuild:
+        await _send_repo_not_linked_message(interaction)
+        return
+    except InstallationNotBoundToGuild:
+        await _send_installation_not_bound_message(interaction)
         return
 
     settings = db.set_issue_settings(
@@ -1761,6 +1805,18 @@ async def _can_use_pr_review_action(
     pr_message: PrMessage,
 ) -> bool:
     db: Database = interaction.client.db  # type: ignore[attr-defined]
+    try:
+        db.assert_repo_linked_to_guild(
+            pr_message.guild_id,
+            f"{pr_message.owner}/{pr_message.repo}",
+        )
+    except RepositoryNotLinkedToGuild:
+        await _send_repo_not_linked_message(interaction)
+        return False
+    except InstallationNotBoundToGuild:
+        await _send_installation_not_bound_message(interaction)
+        return False
+
     settings = db.get_pr_review_settings(pr_message.guild_id)
 
     if settings.review_mode == REVIEW_MODE_ANYONE:
@@ -1816,15 +1872,29 @@ async def _submit_pr_review(
     body: str | None = None,
     activity_detail: str | None = None,
 ) -> None:
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    try:
+        linked_repo = db.assert_repo_linked_to_guild(
+            pr_message.guild_id,
+            f"{pr_message.owner}/{pr_message.repo}",
+        )
+    except RepositoryNotLinkedToGuild:
+        await _send_repo_not_linked_message(interaction)
+        return
+    except InstallationNotBoundToGuild:
+        await _send_installation_not_bound_message(interaction)
+        return
+
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         review = await asyncio.to_thread(
             submit_pull_request_review,
-            pr_message.owner,
-            pr_message.repo,
+            linked_repo.owner,
+            linked_repo.repo,
             pr_message.pr_number,
             event,
             body,
+            linked_repo.installation_id,
         )
     except GitHubAppNotInstalled:
         await interaction.followup.send(
@@ -1872,32 +1942,7 @@ def _resolve_issue_repository(
     owner: str | None,
     repo: str | None,
 ) -> tuple[LinkedRepository | None, str | None]:
-    if bool(owner) != bool(repo):
-        return None, "Please specify both owner and repo."
-
-    if owner and repo:
-        linked_repo = db.get_linked_repository(guild_id, owner, repo)
-        if linked_repo is None:
-            normalized_owner = owner.strip().lower()
-            normalized_repo = repo.strip().lower()
-            return None, f"`{normalized_owner}/{normalized_repo}` is not linked to this server."
-        return linked_repo, None
-
-    if settings and settings.default_owner and settings.default_repo:
-        linked_repo = db.get_linked_repository(
-            guild_id,
-            settings.default_owner,
-            settings.default_repo,
-        )
-        if linked_repo is not None:
-            return linked_repo, None
-
-    linked_repos = db.list_linked_repositories_for_guild(guild_id)
-    if len(linked_repos) == 1:
-        return linked_repos[0], None
-    if len(linked_repos) > 1:
-        return None, "Multiple repositories linked. Please specify owner and repo."
-    return None, "No default repository configured."
+    return resolve_issue_repository(db, guild_id, settings, owner, repo)
 
 
 def _effective_issue_settings(db: Database, guild_id: int) -> IssueSettings:
@@ -1917,19 +1962,28 @@ def _effective_issue_settings(db: Database, guild_id: int) -> IssueSettings:
     )
 
 
-async def _fetch_repository_labels(owner: str, repo: str) -> tuple[str, ...]:
-    labels, _ = await _fetch_repository_label_result(owner, repo)
+async def _fetch_repository_labels(linked_repo: LinkedRepository) -> tuple[str, ...]:
+    labels, _ = await _fetch_repository_label_result(linked_repo)
     return labels
 
 
-async def _fetch_repository_label_result(owner: str, repo: str) -> tuple[tuple[str, ...], bool]:
-    cached_labels = _cached_repository_labels(owner, repo)
+async def _fetch_repository_label_result(
+    linked_repo: LinkedRepository,
+) -> tuple[tuple[str, ...], bool]:
+    owner = linked_repo.owner
+    repo = linked_repo.repo
+    cached_labels = _cached_repository_labels(linked_repo)
     if cached_labels is not None:
         return cached_labels, False
 
     try:
-        labels = await asyncio.to_thread(list_repository_labels, owner, repo)
-        _cache_repository_labels(owner, repo, labels)
+        labels = await asyncio.to_thread(
+            list_repository_labels,
+            owner,
+            repo,
+            linked_repo.installation_id,
+        )
+        _cache_repository_labels(linked_repo, labels)
         return labels, False
     except GitHubAppNotInstalled:
         LOGGER.warning("GitHub App is not installed while fetching labels for %s/%s", owner, repo)
@@ -1951,8 +2005,8 @@ async def _fetch_repository_label_result(owner: str, repo: str) -> tuple[tuple[s
         return (), True
 
 
-def _cached_repository_labels(owner: str, repo: str) -> tuple[str, ...] | None:
-    key = (owner.strip().lower(), repo.strip().lower())
+def _cached_repository_labels(linked_repo: LinkedRepository) -> tuple[str, ...] | None:
+    key = _label_cache_key(linked_repo)
     cached = _LABEL_CACHE.get(key)
     if cached is None:
         return None
@@ -1963,9 +2017,17 @@ def _cached_repository_labels(owner: str, repo: str) -> tuple[str, ...] | None:
     return labels
 
 
-def _cache_repository_labels(owner: str, repo: str, labels: tuple[str, ...]) -> None:
-    key = (owner.strip().lower(), repo.strip().lower())
-    _LABEL_CACHE[key] = (time.monotonic(), labels)
+def _cache_repository_labels(linked_repo: LinkedRepository, labels: tuple[str, ...]) -> None:
+    _LABEL_CACHE[_label_cache_key(linked_repo)] = (time.monotonic(), labels)
+
+
+def _label_cache_key(linked_repo: LinkedRepository) -> tuple[int, int | None, str, str]:
+    return (
+        linked_repo.guild_id,
+        linked_repo.installation_id,
+        linked_repo.owner.strip().lower(),
+        linked_repo.repo.strip().lower(),
+    )
 
 
 def _issue_create_prompt_embed(
@@ -2045,6 +2107,17 @@ async def _create_issue_from_selection(
     db: Database = interaction.client.db  # type: ignore[attr-defined]
     if await _reject_if_issue_creation_blocked(interaction):
         return
+    try:
+        linked_repo = db.assert_repo_linked_to_guild(
+            guild_id,
+            f"{linked_repo.owner}/{linked_repo.repo}",
+        )
+    except RepositoryNotLinkedToGuild:
+        await _send_repo_not_linked_message(interaction)
+        return
+    except InstallationNotBoundToGuild:
+        await _send_installation_not_bound_message(interaction)
+        return
 
     settings = _effective_issue_settings(db, guild_id)
     if interaction.response.is_done():
@@ -2061,6 +2134,7 @@ async def _create_issue_from_selection(
             title,
             body,
             labels,
+            linked_repo.installation_id,
         )
     except GitHubAppNotInstalled:
         LOGGER.warning(
@@ -2354,6 +2428,20 @@ async def _reject_if_issue_creation_blocked(interaction: discord.Interaction) ->
     return True
 
 
+async def _send_repo_not_linked_message(interaction: discord.Interaction) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(REPOSITORY_NOT_LINKED_MESSAGE, ephemeral=True)
+    else:
+        await interaction.response.send_message(REPOSITORY_NOT_LINKED_MESSAGE, ephemeral=True)
+
+
+async def _send_installation_not_bound_message(interaction: discord.Interaction) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(INSTALLATION_NOT_BOUND_MESSAGE, ephemeral=True)
+    else:
+        await interaction.response.send_message(INSTALLATION_NOT_BOUND_MESSAGE, ephemeral=True)
+
+
 async def _send_issue_creation_blocked_log(
     interaction: discord.Interaction,
     blocked_roles: tuple[discord.Role, ...],
@@ -2627,8 +2715,14 @@ async def _build_dashboard(
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
     config = db.get_status(guild_id)
-    linked_repos = db.list_linked_repositories_for_guild(guild_id)
-    installed_repos = db.list_installed_repositories()
+    guild_installations = db.get_guild_installations(guild_id)
+    linked_repos = [
+        linked_repo
+        for linked_repo in db.list_linked_repositories_for_guild(guild_id)
+        if linked_repo.installation_id is not None
+        and db.is_installation_bound_to_guild(guild_id, linked_repo.installation_id)
+    ]
+    installed_repos = db.list_installed_repositories_for_guild(guild_id)
     issue_settings = db.get_issue_settings(guild_id)
     issue_blocked_role_ids = db.get_issue_blocked_roles(guild_id)
     pr_review_mode = str(config["pr_review_mode"])
@@ -2646,7 +2740,10 @@ async def _build_dashboard(
     default_repo = _configured_default_repo(issue_settings)
     if selected_repo is None and section == "default_repo":
         selected_repo = default_repo
-    if selected_repo and not db.get_linked_repository(guild_id, *selected_repo):
+    if selected_repo and not any(
+        linked_repo.owner == selected_repo[0] and linked_repo.repo == selected_repo[1]
+        for linked_repo in linked_repos
+    ):
         selected_repo = None
     if selected_repo is None and linked_repos and section != "default_repo":
         selected_repo = (linked_repos[0].owner, linked_repos[0].repo)
@@ -2670,6 +2767,7 @@ async def _build_dashboard(
         default_repo=default_repo,
         app_statuses=app_statuses,
         bot_ready=interaction.client.is_ready(),
+        has_bound_installation=bool(guild_installations),
     )
     view = GitHubDashboardView(
         guild_id,
@@ -2712,6 +2810,7 @@ def _dashboard_embed(
     default_repo: tuple[str, str] | None,
     app_statuses: dict[tuple[str, str], str],
     bot_ready: bool,
+    has_bound_installation: bool,
 ) -> discord.Embed:
     title = f"Nano GitHub Dashboard - {DASHBOARD_SECTIONS.get(section, 'Overview')}"
     embed = discord.Embed(title=title, color=embeds.NANO_BLUE)
@@ -2726,8 +2825,8 @@ def _dashboard_embed(
         embed.description = "Live server configuration and GitHub integration summary."
         embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
         embed.add_field(
-            name="GitHub App installed repositories",
-            value=_installed_repo_list(installed_repos, linked_repos),
+            name="Installed repositories for this Discord server",
+            value=_installed_repo_list(installed_repos, linked_repos, has_bound_installation),
             inline=False,
         )
         embed.add_field(
@@ -2763,11 +2862,14 @@ def _dashboard_embed(
         return embed
 
     if section == "repositories":
-        embed.description = "Select repositories already known from GitHub App installations."
+        embed.description = (
+            "Installed repositories are repositories the GitHub App installation can see. "
+            "Linked repositories are the repositories this Discord server is allowed to use."
+        )
         embed.add_field(name="Linked repositories", value=_repo_list(linked_repos), inline=False)
         embed.add_field(
-            name="Installed repositories",
-            value=_installed_repo_list(installed_repos, linked_repos),
+            name="Installed repositories for this Discord server",
+            value=_installed_repo_list(installed_repos, linked_repos, has_bound_installation),
             inline=False,
         )
         embed.add_field(
@@ -2855,10 +2957,13 @@ def _dashboard_embed(
         return embed
 
     if section == "github_app":
-        embed.description = "Live GitHub App installation and permission checks."
+        embed.description = (
+            "Live GitHub App checks for repositories linked to this Discord server. "
+            "Installed repositories listed here are informational until linked."
+        )
         embed.add_field(
-            name="Known installed repositories",
-            value=_installed_repo_list(installed_repos, linked_repos),
+            name="Installed repositories for this Discord server",
+            value=_installed_repo_list(installed_repos, linked_repos, has_bound_installation),
             inline=False,
         )
         embed.add_field(
@@ -2913,6 +3018,7 @@ async def _github_app_statuses(
                 check_repository_permissions,
                 linked_repo.owner,
                 linked_repo.repo,
+                linked_repo.installation_id,
             )
         except GitHubAppNotConfigured:
             return key, "GitHub App credentials are not configured"
@@ -2937,7 +3043,7 @@ async def _github_app_statuses(
 
 def _repo_list(linked_repos: list[LinkedRepository]) -> str:
     if not linked_repos:
-        return "None linked. Use the dashboard setup guidance to link a repository."
+        return "No repositories linked to this Discord server."
     lines = []
     for repo in linked_repos:
         installation = f" installation `{repo.installation_id}`" if repo.installation_id else " no installation id yet"
@@ -2948,14 +3054,23 @@ def _repo_list(linked_repos: list[LinkedRepository]) -> str:
 def _installed_repo_list(
     installed_repos: list[InstalledRepository],
     linked_repos: list[LinkedRepository],
+    has_bound_installation: bool,
 ) -> str:
+    if not has_bound_installation:
+        return "No GitHub App installation connected to this Discord server."
     if not installed_repos:
-        return "None known yet. GitHub App webhook deliveries teach Nano GitHub about installations."
+        return "No repositories linked to this Discord server."
     linked = {(repo.owner, repo.repo) for repo in linked_repos}
     lines = []
     for repo in installed_repos:
-        state = "linked" if (repo.owner, repo.repo) in linked else "available"
-        lines.append(f"`{repo.repository_full_name}`: installation `{repo.installation_id}`, {state}")
+        state = (
+            "Linked to this Discord server"
+            if (repo.owner, repo.repo) in linked
+            else "Available to this Discord server"
+        )
+        lines.append(
+            f"`{repo.repository_full_name}`: installation `{repo.installation_id}`, {state}"
+        )
     return _dashboard_value("\n".join(lines))
 
 
@@ -2971,6 +3086,14 @@ def _default_repo_summary(
 ) -> str:
     if default_repo:
         owner, repo = default_repo
+        if not any(
+            linked_repo.owner == owner and linked_repo.repo == repo
+            for linked_repo in linked_repos
+        ):
+            return (
+                "Configured default repository is not linked to this Discord server "
+                "and will be ignored."
+            )
         return f"Configured: `{owner}/{repo}`"
     if len(linked_repos) == 1:
         linked_repo = linked_repos[0]
