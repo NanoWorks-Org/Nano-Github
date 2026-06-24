@@ -1,310 +1,585 @@
 # Nano GitHub
 
-Nano GitHub is a Discord bot for GitHub notifications and pull request review workflows.
+A Discord bot that connects GitHub repositories directly to Discord.
 
-It deliberately separates read-only logging from pull request review:
+Nano GitHub provides:
 
-- **Logging channels** receive normal GitHub event embeds for commits, issues, issue comments, and releases.
-- **Pull request review channels** receive interactive PR review cards with buttons that submit GitHub Pull Request Reviews through the Nano GitHub GitHub App.
-- **Discord issue creation** lets server members create labeled GitHub issues through the Nano GitHub GitHub App without needing GitHub accounts.
+- Commit logging
+- Issue logging
+- Pull request logging
+- Release logging
+- Comment logging
+- Interactive pull request reviews from Discord
+- GitHub App integration
+- Multi-server support
+- Webhook security verification
+- Dashboard integration
 
-## Features
+---
 
-- Python, `discord.py`, FastAPI, and SQLite
-- Slash-command setup per Discord server
-- Per-server linked repository configuration
-- Per-server GitHub issue creation settings
-- GitHub App webhook endpoint at `POST /webhooks/github`
-- HMAC SHA-256 verification for GitHub App and legacy webhook secrets
-- Events supported now:
-  - `push` -> commits log channel
-  - `issues` -> issues log channel
-  - `issue_comment` -> comments log channel
-  - `release` -> releases log channel
-  - `pull_request` -> PR review channel
-- Docker and Docker Compose support
-- Professional dark/blue Discord embeds
+# Features
 
-## Requirements
+## GitHub Activity Logging
+
+Automatically send GitHub events into Discord channels.
+
+Supported events:
+
+- Pushes / Commits
+- Issues
+- Issue Comments
+- Pull Requests
+- Pull Request Reviews
+- Pull Request Review Comments
+- Releases
+
+---
+
+## Pull Request Review System
+
+When a pull request is opened:
+
+- A review embed is posted in Discord
+- Reviewers can:
+  - View PR
+  - Approve
+  - Request Changes
+
+Responses are sent back to GitHub using the installed GitHub App.
+
+---
+
+## GitHub App Integration
+
+Nano GitHub uses a GitHub App instead of personal access tokens.
+
+Benefits:
+
+- More secure
+- Repository-scoped permissions
+- Easier setup
+- Supports multiple repositories
+
+---
+
+## Dashboard
+
+The dashboard provides:
+
+- Linked repositories
+- Installed repositories
+- Default repository
+- Log channels
+- PR review settings
+- GitHub App readiness checks
+
+---
+
+# Requirements
+
+## Discord
+
+- Discord Server
+- Manage Server permission
+- Ability to invite bots
+
+## GitHub
+
+- GitHub organisation or repository
+- Permission to install GitHub Apps
+
+## Hosting
+
+- Docker & Docker Compose recommended
+
+or
 
 - Python 3.11+
-- A Discord application with a bot token
-- A GitHub App with a webhook secret
-- Docker, if running with Compose
 
-## Environment
+---
 
-Copy the example file and fill in your values:
+# Installation
+
+## Option 1 – Docker (Recommended)
+
+### Clone Repository
 
 ```bash
-cp .env.example .env
+git clone https://github.com/nanoworks-org/nano-github.git
+cd nano-github
 ```
 
-Required variables:
+---
+
+### Create Environment File
+
+Create:
 
 ```env
-DISCORD_TOKEN=replace-with-your-discord-bot-token
-GITHUB_APP_ID=replace-with-your-github-app-id
-GITHUB_APP_WEBHOOK_SECRET=replace-with-your-github-app-webhook-secret
-GITHUB_APP_PRIVATE_KEY_PATH=/path/to/github-app-private-key.pem
-API_HOST=0.0.0.0
-API_PORT=8080
-DATABASE_PATH=data/nano_github.sqlite3
+DISCORD_TOKEN=
+CLIENT_ID=
+GUILD_ID=
+
+GITHUB_APP_ID=
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+GITHUB_WEBHOOK_SECRET=
+
+PRIVATE_KEY_PATH=/app/private-key.pem
+
+DATABASE_PATH=/app/data/nano_github.db
+
+WEB_HOST=0.0.0.0
+WEB_PORT=8080
+PUBLIC_URL=https://your-domain.com
 ```
 
-`GITHUB_APP_PRIVATE_KEY` is also supported. If you store it in an environment variable, replace newlines with `\n`.
+---
 
-`GITHUB_WEBHOOK_SECRET` is still supported as a legacy fallback for old manually-created repository webhooks. New GitHub App webhook deliveries use `GITHUB_APP_WEBHOOK_SECRET`.
+### Add GitHub App Private Key
 
-`DATABASE_URL` is also supported for SQLite, for example:
-
-```env
-DATABASE_URL=sqlite:///data/nano_github.sqlite3
-```
-
-## Running Locally
-
-Create a virtual environment and install dependencies:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-On Windows PowerShell:
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-Run the bot and API:
-
-```bash
-python -m nano_github.main
-```
-
-The webhook endpoint will be available at:
+Place:
 
 ```text
-http://localhost:8080/webhooks/github
+private-key.pem
 ```
 
-## Running With Docker
+inside the project directory.
 
-Create `.env`, then run:
+---
+
+### Start
 
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
 
-SQLite data is stored in the `nano-github-data` Docker volume at `/data/nano_github.sqlite3`.
+Check logs:
 
-## Discord Bot Setup
+```bash
+docker logs -f nano-github
+```
 
-Invite the bot to your Discord server with these permissions:
+---
 
+# GitHub App Setup
+
+## Create GitHub App
+
+Create a GitHub App with:
+
+### Permissions
+
+Repository Permissions:
+
+| Permission | Access |
+|------------|---------|
+| Contents | Read |
+| Pull Requests | Read & Write |
+| Issues | Read & Write |
+| Metadata | Read |
+| Commit Statuses | Read |
+| Actions | Read |
+
+---
+
+### Webhook Events
+
+Enable:
+
+- Push
+- Pull Request
+- Pull Request Review
+- Pull Request Review Comment
+- Issues
+- Issue Comment
+- Release
+
+---
+
+### Webhook URL
+
+```text
+https://your-domain.com/github/webhook
+```
+
+---
+
+### Callback URL
+
+```text
+https://your-domain.com/github/install/callback
+```
+
+---
+
+# Discord Setup
+
+Invite the bot using:
+
+```text
+applications.commands
+bot
+```
+
+Recommended permissions:
+
+- View Channels
 - Send Messages
 - Embed Links
-- Use Slash Commands
+- Attach Files
 - Read Message History
-- View Channels
+- Use Slash Commands
 
-Nano GitHub keeps the visible slash-command surface small:
+Administrator is NOT required.
+
+---
+
+# First-Time Setup
+
+## 1. Install GitHub App
+
+Run:
+
+```text
+/github connect
+```
+
+Install the GitHub App when prompted.
+
+---
+
+## 2. Link Repository
+
+```text
+/github repo add owner/repository
+```
+
+Example:
+
+```text
+/github repo add nanoworks-org/nano-github
+```
+
+---
+
+## 3. Set Default Repository
+
+```text
+/github repo default owner/repository
+```
+
+Example:
+
+```text
+/github repo default nanoworks-org/nano-github
+```
+
+---
+
+## 4. Configure Log Channels
+
+Example:
+
+```text
+/github logs commits #github-logs
+/github logs issues #github-logs
+/github logs releases #github-logs
+```
+
+---
+
+# Commands
+
+## General
+
+### Dashboard
 
 ```text
 /github dashboard
-/issue create title description
 ```
 
-Use `/github dashboard` for setup and administration. The dashboard is ephemeral and admin-only, and it is the preferred place to link repositories, choose defaults, review webhook details, check GitHub App readiness, and configure issue/PR behavior.
+Shows:
 
-Normal setup is:
+- Linked repositories
+- Log channels
+- PR settings
+- Installation status
 
-1. Invite the Discord bot.
-2. Install the Nano GitHub GitHub App on the GitHub account, organization, or repository.
-3. Open `/github dashboard`.
-4. Select the installed repository and choose the Discord channels/defaults you want.
+---
 
-You do not need to create repository webhooks manually for normal GitHub App installs.
-
-## Admin Dashboard
-
-Use `/github dashboard` to open an ephemeral Nano GitHub admin control panel. The dashboard requires Administrator or Manage Server permission. If a normal user opens it, Nano GitHub replies ephemerally with:
+### Status
 
 ```text
-You need Administrator or Manage Server permission to use the Nano GitHub dashboard.
+/github status
 ```
 
-Dashboard sections:
+Shows GitHub connectivity and health.
 
-- **Overview** shows linked repositories, log channels, PR review channel and mode, issue creation status, label settings, GitHub App readiness, webhook setup, and bot/API status.
-- **Repositories** lists linked repositories, shows GitHub App installed repositories known to Nano GitHub, and lets admins link from an installed-repository dropdown. Manual owner/repo entry remains available as an advanced fallback.
-- **Default Repository** shows the current default repository, linked repositories, and whether automatic single-repo defaulting is active. Admins can choose the default from a linked-repo dropdown.
-- **Log Channels** shows configured event log channels and setup guidance.
-- **PR Reviews** shows the PR review channel and mode, and includes an interactive selector for basic PR review mode changes.
-- **Issue Creation** shows enabled/disabled state, default repository, submission log, allowed labels, default labels, and buttons to enable/disable issue creation or edit labels.
-- **GitHub App** shows installed repositories known to Nano GitHub, whether the selected linked repository has an installation ID, and whether issue creation and PR review actions are available.
-- **Webhook Info** explains that GitHub App webhooks are automatic. Manual payload URL and per-repository secrets are shown only as legacy/advanced information. The GitHub App webhook secret is never shown in Discord.
+---
 
-Standalone setup/status/config commands are no longer registered in the normal slash-command surface. The dashboard replaces those flows, with channel setup shown as dashboard guidance where a full picker is not implemented yet.
+# Repository Commands
 
-## Discord Issue Creation
-
-Issue creation is configured per Discord server and always uses a repository linked to that same server.
-
-Normal server members can create issues unless issue creation has been disabled:
+## Add Repository
 
 ```text
-/issue create title:"Add dark mode" description:"Please add a dark theme."
-/issue create title:"Sync failed" description:"The webhook did not post." labels:"bug"
+/github repo add owner/repository
 ```
 
-Repository selection works like this:
-
-- Dashboard interactions can explicitly choose a repository where needed.
-- If a default repository is configured in the dashboard, Nano GitHub uses it.
-- If no default is configured and the server has exactly one linked repository, Nano GitHub uses that repository automatically.
-- If multiple repositories are linked and no default is configured, `/issue create` shows a Discord linked-repository dropdown.
-
-Normal users do not type GitHub owner/repo names. Owner/repo entry is reserved for admin dashboard setup flows and advanced maintenance code paths.
-
-Issue type is label-based. `/issue create` no longer asks for a separate suggestion/bug type. Labels determine whether an issue is a bug, suggestion, enhancement, feature request, or anything else your GitHub repository uses.
-
-Labels are pulled live from the selected GitHub repository using the GitHub App installation token. Users can use slash-command autocomplete for the optional `labels` field, or run `/issue create` without labels and choose from a Discord label select menu before creating the issue. If the repository has more labels than Discord can display in a select menu, Nano GitHub shows the first set and autocomplete can be used to search.
-
-If labels are selected, Nano GitHub applies those labels. If no labels are selected, Nano GitHub applies the server’s configured default labels if present, otherwise it creates the issue with no labels. Admins can configure allowed labels and default labels per server in the dashboard. When allowed labels are configured, the autocomplete and dropdown only show allowed labels. If a requested GitHub label disappears before creation, the issue is still created, valid labels are applied, and the Discord reply lists failed labels.
-
-When `/issue create` creates a GitHub issue, Nano GitHub records the issue URL and number. If the GitHub `issues.opened` webhook arrives for that same issue, Nano GitHub suppresses the duplicate public issue-log embed while keeping the user command success response and the optional issue submission log.
-
-Created GitHub issues include the submitted description plus a short Discord source footer containing only the Discord username.
-
-Discord users do not need GitHub accounts. Issue creation uses the Nano GitHub GitHub App installation token for the selected repository. The GitHub App must be installed on that repository and have `Issues: Read and write` permission.
-
-## GitHub App Webhook Setup
-
-Configure the webhook on the Nano GitHub GitHub App itself:
-
-1. In the GitHub App settings, enable webhooks.
-2. Set **Webhook URL** to your public endpoint, for example:
-
-   ```text
-   https://your-domain.example/webhooks/github
-   ```
-
-3. Set **Webhook secret** to the same value as `GITHUB_APP_WEBHOOK_SECRET`.
-4. Subscribe the App to these repository events:
-   - Pushes
-   - Issues
-   - Issue comments
-   - Pull requests
-   - Releases
-5. Save the GitHub App, then install it on the account, organization, or repository.
-
-When GitHub sends App webhooks, Nano GitHub verifies `X-Hub-Signature-256` with `GITHUB_APP_WEBHOOK_SECRET`, records the App `installation.id`, and learns repositories from GitHub App installation payloads and repository webhook payloads. If a repository is installed but not linked to a Discord server yet, Nano GitHub accepts the delivery with `202` and logs that no guild is linked.
-
-For local development, expose `localhost:8080` through a tunnel such as ngrok or Cloudflare Tunnel, then use the public tunnel URL as the Payload URL.
-
-### Legacy Manual Repository Webhooks
-
-Manual repository webhooks are optional and should only be used for older setups or advanced maintenance. In a GitHub repository, create a webhook only if you cannot use the GitHub App webhook:
-
-1. Open **Settings** -> **Webhooks** -> **Add webhook**.
-2. Set **Payload URL** to `https://your-domain.example/webhooks/github`.
-3. Set **Content type** to `application/json`.
-4. Set **Secret** to that linked repository's legacy secret from `/github dashboard` -> **Webhook Info**.
-5. Select Pushes, Issues, Issue comments, Pull requests, and Releases.
-
-Legacy per-repository secrets are scoped to the Discord guild/repository link. Nano GitHub does not expose `GITHUB_APP_WEBHOOK_SECRET` in Discord.
-
-## Log Channels vs PR Review Channel
-
-Commits, issues, issue comments, and releases are notification events. They are sent as read-only embeds to the log channel configured for their event type.
-
-Issue embeds show the issue title, body preview, repository, author, state, labels, author avatar when GitHub provides one, and a View Issue link button.
-
-Push events are formatted as commit notifications. A single-commit push sends one detailed commit embed. Pushes with 2-5 commits send one embed per commit. Pushes with more than 5 commits send a summary embed plus the first 5 commit embeds. Empty pushes are ignored unless GitHub marks them as branch creation or deletion events.
-
-Pull requests are workflow events. They are not posted to normal log channels. They are sent to the configured PR review channel as interactive review cards that include:
-
-- PR title and number
-- Repository
-- Author
-- Source branch -> target branch
-- Changed files, additions, and deletions when GitHub includes them
-- Current state
-- Direct GitHub link
-- Buttons for View Pull Request, Approve, Request Changes, and Comment
-
-The button behavior is:
-
-- **View Pull Request** opens GitHub and does not require GitHub API permissions.
-- **Approve** submits a Pull Request Review with event `APPROVE` and the body `Approved from Discord by <Discord username>.`
-- **Request Changes** opens a Discord modal, requires a short reason, and submits a Pull Request Review with event `REQUEST_CHANGES`.
-- **Comment** opens a Discord modal, collects review text, and submits a Pull Request Review with event `COMMENT` prefixed with `Comment from Discord by <Discord username>:`.
-
-After Approve, Request Changes, or Comment succeeds on GitHub, Nano GitHub edits the original PR review card and adds or updates a `Latest Review Activity` field with the action, Discord username, short reason or comment when provided, and timestamp. The View Pull Request button remains on updated cards, and the review buttons use persistent custom IDs so they continue working after bot restarts.
-
-PR review card colors:
-
-- Waiting/open/pending review: orange
-- Approved from Discord: green
-- Changes requested from Discord: red
-- Comment-only activity: neutral Nano blue
-
-Review actions use a repository installation token for the linked repository. The GitHub App must have `Pull requests: Read and write` permission. If the permission is missing, Nano GitHub replies with a friendly Discord error such as:
+Example:
 
 ```text
-Nano GitHub does not currently have Pull Request Review permissions for this repository.
+/github repo add nanoworks-org/nano-github
 ```
 
-PR review actions are configured per Discord server:
+---
 
-- `Anyone` allows any server member who can see the PR card to use the review buttons.
-- `GitHub Reviewers Only` allows users whose Discord username or server display name matches a currently requested GitHub reviewer login cached from pull request webhooks.
-- `Discord Role Restricted` allows only members with the configured Discord role.
+## Remove Repository
 
-Use `/github dashboard` -> GitHub App to verify repository installation, installation token generation, issue creation permission, and pull request review permission. Dashboard actions are admin-only, with the dashboard accepting Administrator or Manage Server. Normal users can run `/issue create` when issue creation is enabled.
-
-Required GitHub App repository permissions:
-
-- Metadata: read-only, required by GitHub Apps.
-- Issues: read and write, required for `/issue create`.
-- Pull requests: read and write, required for Approve, Request Changes, and Comment.
-
-## Webhook Behavior
-
-- Webhook signatures are verified with `X-Hub-Signature-256`.
-- GitHub App webhook signatures are verified with `GITHUB_APP_WEBHOOK_SECRET` when the payload includes an `installation`.
-- Legacy manual repository webhooks continue to use per-repository secrets, with `GITHUB_WEBHOOK_SECRET` kept as a fallback for older deployments.
-- Malformed JSON returns `400` and is logged without crashing the bot.
-- App events for installed repositories not linked to a Discord server are accepted with `202` and logged as unlinked.
-- Legacy events for repositories not linked to a Discord server are rejected unless they can be verified for a linked repository.
-- If a channel is not configured for an event, the event is skipped and a warning is logged.
-- PR review cards are updated when Nano GitHub has already stored a Discord message for that PR.
-- Issue webhooks for issues created by `/issue create` are deduplicated against the recorded issue URL/number to avoid duplicate public issue embeds.
-
-## Development Checks
-
-Install development dependencies:
-
-```bash
-pip install ".[dev]"
+```text
+/github repo remove owner/repository
 ```
 
-Run Ruff:
+---
 
-```bash
-ruff check .
+## List Repositories
+
+```text
+/github repo list
 ```
 
-Build Docker image:
+---
 
-```bash
-docker compose build
+## Set Default Repository
+
+```text
+/github repo default owner/repository
 ```
-THIS NEEDS REDOING!
 
-I will redo it later
+---
+
+# Logging Commands
+
+## Commit Logs
+
+```text
+/github logs commits #channel
+```
+
+---
+
+## Issue Logs
+
+```text
+/github logs issues #channel
+```
+
+---
+
+## Comment Logs
+
+```text
+/github logs comments #channel
+```
+
+---
+
+## Release Logs
+
+```text
+/github logs releases #channel
+```
+
+---
+
+## Pull Request Logs
+
+```text
+/github logs pullrequests #channel
+```
+
+---
+
+# Pull Request Review Commands
+
+## Configure Review Channel
+
+```text
+/github pr channel #reviews
+```
+
+---
+
+## Restrict Reviews to Discord Role
+
+```text
+/github pr role @Developers
+```
+
+Only members with the role can approve or request changes.
+
+---
+
+## Disable Role Restriction
+
+```text
+/github pr role disable
+```
+
+---
+
+# Issue Creation
+
+## Enable
+
+```text
+/github issues enable
+```
+
+Allows users to create GitHub issues from Discord.
+
+---
+
+## Disable
+
+```text
+/github issues disable
+```
+
+---
+
+## Set Submission Log
+
+```text
+/github issues log #github-submissions
+```
+
+---
+
+# Example Workflow
+
+## Developer Opens Pull Request
+
+GitHub:
+
+```text
+feature/login-system
+→ main
+```
+
+---
+
+## Discord Receives Embed
+
+```text
+PR #42
+Add login system
+
+Author:
+DuckQuack001
+
+Repository:
+nanoworks-org/nano-github
+```
+
+Buttons:
+
+- View PR
+- Approve
+- Request Changes
+
+---
+
+## Reviewer Approves
+
+Discord reviewer presses:
+
+```text
+Approve
+```
+
+Nano GitHub:
+
+- Creates GitHub review
+- Updates PR
+- Logs action
+
+---
+
+# Security
+
+Nano GitHub includes:
+
+- GitHub webhook signature verification
+- GitHub App authentication
+- Repository ownership validation
+- Role-restricted reviews
+- SQLite persistence
+- Audit logging
+
+---
+
+# Troubleshooting
+
+## GitHub App Not Connected
+
+Check:
+
+```text
+/github status
+```
+
+Verify:
+
+- App installed
+- App permissions granted
+- Webhook URL reachable
+
+---
+
+## No Events Arriving
+
+Check:
+
+1. GitHub App installed on repository
+2. Webhook deliveries successful
+3. Bot online
+4. Log channels configured
+
+---
+
+## Review Buttons Not Working
+
+Check:
+
+- GitHub App permissions
+- PR review role restrictions
+- Repository linked correctly
+
+---
+
+# Resetting Nano GitHub
+
+If credentials are compromised:
+
+1. Revoke GitHub App installation.
+2. Generate a new private key.
+3. Regenerate webhook secret.
+4. Update `.env`.
+5. Restart Nano GitHub.
+6. Reinstall the GitHub App.
+
+---
+
+# Nano Works
+
+Nano GitHub is part of the Nano Works ecosystem.
+
+Additional services currently in development:
+
+- Nano Community
+- Nano Server
+- Nano Dashboard
+
+---
+© Nano Works
