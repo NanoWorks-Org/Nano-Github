@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import logging
+import math
+import platform
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from typing import Literal
 from urllib.parse import quote
 
@@ -51,6 +56,7 @@ LogEventType = Literal["commits", "issues", "comments", "releases"]
 LOG_DASHBOARD_TYPES = (*LOG_EVENT_TYPES, "pr_reviews")
 WEBHOOK_PAYLOAD_URL = "https://api.nanoworks.co.uk/webhooks/github"
 WEBHOOK_EVENTS = "Pushes, Issues, Issue comments, Pull requests, Releases"
+SUPPORT_EMAIL = "contact@nanoworks.co.uk"
 LABEL_FETCH_WARNING = (
     "GitHub labels could not be loaded. You can still create the issue without labels."
 )
@@ -1406,6 +1412,9 @@ class NanoGitHubBot(commands.Bot):
         intents = discord.Intents.default()
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.db = db
+        self.started_at = time.monotonic()
+        self.webhook_server_running = False
+        self.tree.add_command(help_command)
         self.tree.add_command(github_group)
         self.tree.add_command(issue_group)
 
@@ -1432,6 +1441,131 @@ issue_group = app_commands.Group(
     name="issue",
     description="Create and configure GitHub issues from Discord.",
 )
+
+
+@app_commands.command(
+    name="help",
+    description="View Nano GitHub support and diagnostics information.",
+)
+async def help_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    embed = await _build_help_embed(interaction)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+async def _build_help_embed(interaction: discord.Interaction) -> discord.Embed:
+    client = interaction.client
+    bot_version = _bot_version()
+    db_status, github_status = await asyncio.gather(
+        asyncio.to_thread(_database_status, getattr(client, "db", None)),
+        asyncio.to_thread(_github_api_status),
+    )
+    latency = _latency_display(getattr(client, "latency", None))
+    uptime = _uptime_display(getattr(client, "started_at", None))
+    webhook_status = (
+        "Running" if getattr(client, "webhook_server_running", False) else "Offline"
+    )
+
+    embed = discord.Embed(
+        title="Nano GitHub Support & Diagnostics",
+        description=(
+            "A Discord bot for GitHub notifications, issue creation, and pull request "
+            "review workflows."
+        ),
+        color=embeds.NANO_BLUE,
+    )
+    embed.add_field(
+        name="ℹ️ General Information",
+        value=(
+            f"**Bot:** Nano GitHub v{bot_version}\n"
+            "**Description:** GitHub events, server configuration, issue creation, "
+            "and PR review tools for Discord.\n"
+            f"**Support:** [{SUPPORT_EMAIL}](mailto:{SUPPORT_EMAIL})\n"
+            "**Reporting issues:** Include the debug information below when contacting support."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛠️ Basic Debug Information",
+        value="\n".join(
+            [
+                f"**Bot version:** `{bot_version}`",
+                f"**Discord.py version:** `{discord.__version__}`",
+                f"**Python version:** `{platform.python_version()}`",
+                f"**Bot latency:** `{latency}`",
+                f"**Current guild count:** `{len(client.guilds)}`",
+                f"**Current uptime:** `{uptime}`",
+                f"**Database status:** `{db_status}`",
+                f"**GitHub API status:** `{github_status}`",
+                f"**Webhook server status:** `{webhook_status}`",
+            ]
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Nano GitHub support")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+def _bot_version() -> str:
+    try:
+        return version("nano-github")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _database_status(db: object) -> str:
+    try:
+        if not isinstance(db, Database):
+            return "Error"
+        db.health_check()
+    except Exception:
+        LOGGER.exception("Nano GitHub database health check failed")
+        return "Error"
+    return "Connected"
+
+
+def _github_api_status() -> str:
+    try:
+        request = urllib.request.Request(
+            app_settings.github_api_base_url.rstrip("/"),
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "Nano-GitHub",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return "Connected" if response.status < 500 else "Error"
+    except urllib.error.HTTPError as exc:
+        return "Connected" if exc.code < 500 else "Error"
+    except (OSError, ValueError):
+        return "Error"
+
+
+def _latency_display(latency_seconds: object) -> str:
+    if not isinstance(latency_seconds, (float, int)) or not math.isfinite(latency_seconds):
+        return "Unknown"
+    return f"{round(float(latency_seconds) * 1000)} ms"
+
+
+def _uptime_display(started_at: object) -> str:
+    if not isinstance(started_at, (float, int)):
+        return "Unknown"
+    elapsed_seconds = max(0, int(time.monotonic() - float(started_at)))
+    days, remainder = divmod(elapsed_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
 
 
 def _require_guild(interaction: discord.Interaction) -> int | None:
@@ -1768,7 +1902,10 @@ async def status(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@github_group.command(name="dashboard", description="Open the Nano GitHub configuration dashboard.")
+@github_group.command(
+    name="dashboard",
+    description="[Admin Only] View the Nano GitHub dashboard and current server configuration.",
+)
 async def dashboard(interaction: discord.Interaction) -> None:
     guild_id = _require_guild(interaction)
     if guild_id is None:

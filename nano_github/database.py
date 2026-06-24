@@ -137,6 +137,11 @@ class Database:
         with self._lock:
             self._connection.close()
 
+    def health_check(self) -> bool:
+        with self._lock:
+            self._connection.execute("SELECT 1").fetchone()
+        return True
+
     def init(self) -> None:
         with self._lock, self._connection:
             self._connection.executescript(

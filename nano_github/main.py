@@ -46,6 +46,7 @@ async def run() -> None:
             pass
 
     api_task = asyncio.create_task(server.serve(), name="nano-github-api")
+    bot.webhook_server_running = True
     bot_task = asyncio.create_task(bot.start(settings.discord_token), name="nano-github-discord")
 
     done, pending = await asyncio.wait(
@@ -61,6 +62,7 @@ async def run() -> None:
             raise exception
 
     server.should_exit = True
+    bot.webhook_server_running = False
     await bot.close()
 
     for task in pending:
@@ -75,4 +77,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

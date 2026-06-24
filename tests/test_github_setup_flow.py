@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import time
 import unittest
 from datetime import timedelta
 from importlib.util import find_spec
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from nano_github.database import Database, _format_datetime, _parse_datetime, _utc_now
@@ -294,6 +297,46 @@ class GitHubSetupFlowTests(unittest.TestCase):
             "Confirm Reset Server Config",
             [getattr(item, "label", None) for item in reset_view.children],
         )
+
+    def test_help_embed_contains_support_and_diagnostics(self) -> None:
+        if not HAS_DISCORD:
+            self.skipTest("discord.py is not installed in this test runtime")
+        from nano_github.discord_bot import _build_help_embed
+
+        client = SimpleNamespace(
+            db=self.db,
+            guilds=[object(), object()],
+            latency=0.1234,
+            started_at=time.monotonic() - 125,
+            webhook_server_running=True,
+        )
+        interaction = SimpleNamespace(client=client)
+
+        with patch("nano_github.discord_bot._github_api_status", return_value="Connected"):
+            embed = asyncio.run(_build_help_embed(interaction))  # type: ignore[arg-type]
+
+        field_values = "\n".join(field.value for field in embed.fields)
+        self.assertEqual(embed.title, "Nano GitHub Support & Diagnostics")
+        self.assertIn("contact@nanoworks.co.uk", field_values)
+        self.assertIn("**Bot version:**", field_values)
+        self.assertIn("**Discord.py version:**", field_values)
+        self.assertIn("**Python version:**", field_values)
+        self.assertIn("**Bot latency:** `123 ms`", field_values)
+        self.assertIn("**Current guild count:** `2`", field_values)
+        self.assertIn("**Database status:** `Connected`", field_values)
+        self.assertIn("**GitHub API status:** `Connected`", field_values)
+        self.assertIn("**Webhook server status:** `Running`", field_values)
+
+    def test_dashboard_command_description_is_admin_prefixed(self) -> None:
+        if not HAS_DISCORD:
+            self.skipTest("discord.py is not installed in this test runtime")
+        from nano_github.discord_bot import github_group
+
+        command = github_group.get_command("dashboard")
+
+        self.assertIsNotNone(command)
+        description = command.description if command else ""
+        self.assertTrue(description.startswith("[Admin Only]"))
 
     def test_repository_dropdown_only_uses_bound_installations(self) -> None:
         self.db.add_guild_installation(GUILD_ID, INSTALLATION_ID)
