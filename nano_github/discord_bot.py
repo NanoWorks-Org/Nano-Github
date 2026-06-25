@@ -60,6 +60,9 @@ SUPPORT_EMAIL = "contact@nanoworks.co.uk"
 LABEL_FETCH_WARNING = (
     "GitHub labels could not be loaded. You can still create the issue without labels."
 )
+NO_REPOSITORY_LABELS_CHOICE = "__nano_github_no_repository_labels__"
+NO_ALLOWED_REPOSITORY_LABELS_CHOICE = "__nano_github_no_allowed_repository_labels__"
+REPOSITORY_LABELS_UNAVAILABLE_CHOICE = "__nano_github_repository_labels_unavailable__"
 DASHBOARD_ACCESS_MESSAGE = (
     "You need Administrator or Manage Server permission to use the Nano GitHub dashboard."
 )
@@ -1945,14 +1948,46 @@ async def issue_labels_autocomplete(
 
     db: Database = interaction.client.db  # type: ignore[attr-defined]
     settings = _effective_issue_settings(db, guild_id)
-    linked_repo, _ = _resolve_issue_repository(db, guild_id, settings, None, None)
+    selected_repo = _namespace_value(interaction, "repository")
+    if selected_repo and _parse_repo_value(selected_repo) is None:
+        return []
+    owner, repo = _repository_parts_from_value(selected_repo)
+    linked_repo, error_message = _resolve_issue_repository(db, guild_id, settings, owner, repo)
     if linked_repo is None:
+        if error_message:
+            return [
+                app_commands.Choice(
+                    name=error_message[:100],
+                    value=REPOSITORY_LABELS_UNAVAILABLE_CHOICE,
+                )
+            ]
         return []
 
-    if settings.allowed_labels:
-        labels = settings.allowed_labels
-    else:
-        labels = await _fetch_repository_labels(linked_repo)
+    repository_labels, label_warning = await _fetch_repository_label_result(linked_repo)
+    if label_warning:
+        return [
+            app_commands.Choice(
+                name="GitHub labels could not be loaded",
+                value=REPOSITORY_LABELS_UNAVAILABLE_CHOICE,
+            )
+        ]
+    if not repository_labels:
+        return [
+            app_commands.Choice(
+                name=f"{linked_repo.owner}/{linked_repo.repo} has no labels"[:100],
+                value=NO_REPOSITORY_LABELS_CHOICE,
+            )
+        ]
+
+    labels = _available_issue_labels(settings, repository_labels)
+    if not labels:
+        return [
+            app_commands.Choice(
+                name="No repository labels match this server's allowed labels",
+                value=NO_ALLOWED_REPOSITORY_LABELS_CHOICE,
+            )
+        ]
+
     query = current.rsplit(",", 1)[-1].strip().lower()
     prefix = current[: len(current) - len(current.rsplit(",", 1)[-1])]
     matches = [label for label in labels if not query or query in label.lower()]
@@ -1962,18 +1997,48 @@ async def issue_labels_autocomplete(
     ]
 
 
+async def issue_repository_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    guild_id = _require_guild(interaction)
+    if guild_id is None:
+        return []
+
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+    query = current.strip().lower()
+    linked_repos = db.list_linked_repositories_for_guild(guild_id)
+    matches = [
+        linked_repo
+        for linked_repo in linked_repos
+        if not query or query in f"{linked_repo.owner}/{linked_repo.repo}".lower()
+    ]
+    return [
+        app_commands.Choice(
+            name=f"{linked_repo.owner}/{linked_repo.repo}"[:100],
+            value=f"{linked_repo.owner}/{linked_repo.repo}"[:100],
+        )
+        for linked_repo in matches[:25]
+    ]
+
+
 @issue_group.command(name="create", description="Create a GitHub issue from Discord.")
 @app_commands.describe(
     title="GitHub issue title",
     description="GitHub issue description",
-    labels="Optional GitHub label; use autocomplete or choose labels after running the command",
+    labels="GitHub labels; use autocomplete and comma-separate multiple labels",
+    repository="Leave blank to use the server's default repository.",
 )
-@app_commands.autocomplete(labels=issue_labels_autocomplete)
+@app_commands.autocomplete(
+    labels=issue_labels_autocomplete,
+    repository=issue_repository_autocomplete,
+)
 async def create_issue(
     interaction: discord.Interaction,
     title: str,
     description: str,
-    labels: str | None = None,
+    labels: str,
+    repository: str | None = None,
 ) -> None:
     guild_id = _require_guild(interaction)
     if guild_id is None:
@@ -1998,36 +2063,38 @@ async def create_issue(
         )
         return
 
-    linked_repo, error_message = _resolve_issue_repository(db, guild_id, settings, None, None)
+    if repository and _parse_repo_value(repository) is None:
+        await interaction.response.send_message(
+            "Could not identify that repository.",
+            ephemeral=True,
+        )
+        return
+    owner, repo = _repository_parts_from_value(repository)
+    linked_repo, error_message = _resolve_issue_repository(db, guild_id, settings, owner, repo)
     if error_message:
-        linked_repos = db.list_linked_repositories_for_guild(guild_id)
-        if linked_repos and "Multiple repositories linked" in error_message:
-            view = IssueCreateView(
-                guild_id,
-                int(interaction.channel_id),
-                interaction.user.id,
-                title,
-                description,
-                settings,
-                linked_repos,
-                None,
-                (),
-            )
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="Choose Repository",
-                    description="This server has multiple linked repositories and no default.",
-                    color=embeds.NANO_BLUE,
-                ),
-                view=view,
-                ephemeral=True,
-            )
-            return
         await interaction.response.send_message(error_message, ephemeral=True)
         return
     if linked_repo is None:
         await interaction.response.send_message(
             NO_REPOSITORY_CONFIGURED_MESSAGE,
+            ephemeral=True,
+        )
+        return
+    if labels == NO_REPOSITORY_LABELS_CHOICE:
+        await interaction.response.send_message(
+            f"`{linked_repo.owner}/{linked_repo.repo}` has no GitHub labels.",
+            ephemeral=True,
+        )
+        return
+    if labels == NO_ALLOWED_REPOSITORY_LABELS_CHOICE:
+        await interaction.response.send_message(
+            "No labels in this repository match this server's allowed labels.",
+            ephemeral=True,
+        )
+        return
+    if labels == REPOSITORY_LABELS_UNAVAILABLE_CHOICE:
+        await interaction.response.send_message(
+            "GitHub labels could not be loaded. Try again shortly or enter labels manually.",
             ephemeral=True,
         )
         return
@@ -2039,41 +2106,15 @@ async def create_issue(
             ephemeral=True,
         )
         return
-    if labels:
-        await _create_issue_from_selection(
-            interaction,
-            int(interaction.channel_id),
-            linked_repo,
-            title,
-            description,
-            requested_labels,
-            blocked_labels,
-        )
-        return
 
-    label_result = await _fetch_repository_label_result(linked_repo)
-    repo_labels = _available_issue_labels(settings, label_result[0])
-    view = IssueCreateView(
-        guild_id,
+    await _create_issue_from_selection(
+        interaction,
         int(interaction.channel_id),
-        interaction.user.id,
+        linked_repo,
         title,
         description,
-        settings,
-        [linked_repo],
-        linked_repo,
-        repo_labels,
-        label_warning=label_result[1],
-    )
-    await interaction.response.send_message(
-        embed=_issue_create_prompt_embed(
-            linked_repo,
-            view.selected_labels,
-            repo_labels,
-            label_warning=view.label_warning,
-        ),
-        view=view,
-        ephemeral=True,
+        requested_labels,
+        blocked_labels,
     )
 
 
@@ -3839,6 +3880,23 @@ def _parse_repo_value(value: str) -> tuple[str, str] | None:
     if not owner or not repo:
         return None
     return owner, repo
+
+
+def _repository_parts_from_value(value: str | None) -> tuple[str | None, str | None]:
+    if not value:
+        return None, None
+    parsed = _parse_repo_value(value)
+    if parsed is None:
+        return None, None
+    return parsed
+
+
+def _namespace_value(interaction: discord.Interaction, name: str) -> str | None:
+    namespace = getattr(interaction, "namespace", None)
+    if namespace is None:
+        return None
+    value = getattr(namespace, name, None)
+    return value if isinstance(value, str) else None
 
 
 async def _resolve_text_channel(

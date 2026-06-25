@@ -298,6 +298,32 @@ class RepositoryIsolationTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(linked_repo, self.guild_a_repo)
 
+    def test_selected_repo_overrides_default_repo_for_issue_creation(self) -> None:
+        installation_c = 333
+        repo_c = "ownerC/repoC"
+        self.db.add_guild_installation(GUILD_A, installation_c, "ownerC", "User")
+        self.db.upsert_installed_repository(installation_c, "ownerC", "repoC", repo_c)
+        guild_a_repo_c = self.db.link_repository(
+            GUILD_A,
+            "ownerC",
+            "repoC",
+            installation_id=installation_c,
+            repository_full_name=repo_c,
+        )
+        self.db.set_issue_default_repository(GUILD_A, "ownerA", "repoA")
+        settings = self.db.get_issue_settings(GUILD_A)
+
+        linked_repo, error = resolve_issue_repository(
+            self.db,
+            GUILD_A,
+            settings,
+            "ownerC",
+            "repoC",
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(linked_repo, guild_a_repo_c)
+
     def test_linked_repo_uses_installation_id_from_guild_record(self) -> None:
         linked_repo = self.db.assert_repo_linked_to_guild(GUILD_A, REPO_A)
 
