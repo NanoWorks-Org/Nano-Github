@@ -20,6 +20,7 @@ REVIEW_MODES = {
     REVIEW_MODE_GITHUB_REVIEWERS,
     REVIEW_MODE_DISCORD_ROLE,
 }
+ISSUE_SUBMISSIONS_LOG_EVENT_TYPE = "issue_submissions"
 
 
 @dataclass(frozen=True)
@@ -321,6 +322,7 @@ class Database:
             self._ensure_pr_message_review_columns()
             self._ensure_issue_settings_label_columns()
             self._ensure_issue_blocked_roles_table()
+            self._migrate_issue_submission_log_channels()
 
     def upsert_guild(self, guild_id: int, guild_name: str | None = None) -> None:
         with self._lock, self._connection:
@@ -1276,8 +1278,6 @@ class Database:
         self.assert_repo_linked_to_guild(guild_id, f"{default_owner}/{default_repo}")
         suggestion_label = _normalize_label(suggestion_label, "suggestion")
         bug_label = _normalize_label(bug_label, "bug")
-        allowed_labels_json = json.dumps(_normalize_label_list(allowed_labels or []))
-        default_labels_json = json.dumps(_normalize_label_list(default_labels or []))
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -1310,9 +1310,9 @@ class Database:
                     default_repo,
                     suggestion_label,
                     bug_label,
-                    allowed_labels_json,
-                    default_labels_json,
-                    submission_log_channel_id,
+                    "[]",
+                    "[]",
+                    None,
                 ),
             )
 
@@ -1402,9 +1402,6 @@ class Database:
             default_repo,
             suggestion_label=current.suggestion_label if current else "suggestion",
             bug_label=current.bug_label if current else "bug",
-            allowed_labels=current.allowed_labels if current else (),
-            default_labels=current.default_labels if current else (),
-            submission_log_channel_id=current.submission_log_channel_id if current else None,
         )
 
     def set_issue_submission_log_channel(
@@ -1412,36 +1409,14 @@ class Database:
         guild_id: int,
         channel_id: int | None,
     ) -> IssueSettings:
-        current = self.get_issue_settings(guild_id)
-        with self._lock, self._connection:
-            self._connection.execute(
-                "INSERT OR IGNORE INTO guilds (guild_id) VALUES (?)",
-                (guild_id,),
-            )
-            self._connection.execute(
-                """
-                INSERT INTO issue_settings (
-                    guild_id,
-                    suggestion_label,
-                    bug_label,
-                    allowed_labels,
-                    default_labels,
-                    submission_log_channel_id,
-                    enabled
-                )
-                VALUES (?, 'suggestion', 'bug', '[]', '[]', ?, 1)
-                ON CONFLICT(guild_id) DO UPDATE SET
-                    submission_log_channel_id = excluded.submission_log_channel_id,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (guild_id, channel_id),
-            )
+        if channel_id is None:
+            self.clear_log_channel(guild_id, ISSUE_SUBMISSIONS_LOG_EVENT_TYPE)
+        else:
+            self.set_log_channel(guild_id, ISSUE_SUBMISSIONS_LOG_EVENT_TYPE, channel_id)
 
         settings = self.get_issue_settings(guild_id)
         if settings is None:
-            raise RuntimeError("Failed to update issue submission log channel")
-        if current is None:
-            return settings
+            return self.set_issue_creation_enabled(guild_id, True)
         return settings
 
     def get_issue_blocked_roles(self, guild_id: int) -> tuple[int, ...]:
@@ -1764,6 +1739,23 @@ class Database:
             """
         )
 
+    def _migrate_issue_submission_log_channels(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(issue_settings)").fetchall()
+        }
+        if "submission_log_channel_id" not in columns:
+            return
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO log_channels (guild_id, event_type, channel_id)
+            SELECT guild_id, ?, submission_log_channel_id
+            FROM issue_settings
+            WHERE submission_log_channel_id IS NOT NULL
+            """,
+            (ISSUE_SUBMISSIONS_LOG_EVENT_TYPE,),
+        )
+
 
 def _normalize_repo(owner: str, repo: str) -> tuple[str, str]:
     return owner.strip().lower(), repo.strip().lower()
@@ -1890,16 +1882,15 @@ def _pr_review_settings_from_row(row: sqlite3.Row) -> PrReviewSettings:
 
 
 def _issue_settings_from_row(row: sqlite3.Row) -> IssueSettings:
-    log_channel_id = row["submission_log_channel_id"]
     return IssueSettings(
         guild_id=int(row["guild_id"]),
         default_owner=row["default_owner"],
         default_repo=row["default_repo"],
         suggestion_label=row["suggestion_label"],
         bug_label=row["bug_label"],
-        allowed_labels=_json_string_tuple(row["allowed_labels"]),
-        default_labels=_json_string_tuple(row["default_labels"]),
-        submission_log_channel_id=int(log_channel_id) if log_channel_id is not None else None,
+        allowed_labels=(),
+        default_labels=(),
+        submission_log_channel_id=None,
         enabled=bool(row["enabled"]),
     )
 

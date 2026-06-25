@@ -141,9 +141,11 @@ You can choose separate channels for each event type.
 
 ---
 
-### Pull Request Logs
+### Issue Submission Logs
 
-/github logs pullrequests #github-logs
+/github logs issue_submissions #github-submissions
+
+All issue submissions and blocked issue-creation attempts will be logged for staff review.
 
 ---
 
@@ -165,6 +167,7 @@ Only members with this role will be able to:
 
 * Approve pull requests
 * Request changes
+* Use pull request moderation buttons
 
 ---
 
@@ -190,11 +193,7 @@ Anyone with access to the review channel may review pull requests.
 
 ---
 
-### Configure Submission Logs
-
-/github issues log #github-submissions
-
-All issue submissions will be logged for staff review.
+Issue labels are loaded directly from the selected GitHub repository. No default or allowed labels are configured in Nano GitHub.
 
 ---
 
@@ -242,7 +241,7 @@ Check GitHub connection status.
 
 /github logs releases #channel
 
-/github logs pullrequests #channel
+/github logs issue_submissions #channel
 
 ---
 
@@ -261,8 +260,6 @@ Check GitHub connection status.
 /github issues enable
 
 /github issues disable
-
-/github issues log #channel
 
 ---
 

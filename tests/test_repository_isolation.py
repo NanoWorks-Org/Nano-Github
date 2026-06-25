@@ -7,6 +7,7 @@ from pathlib import Path
 
 from nano_github.database import (
     Database,
+    ISSUE_SUBMISSIONS_LOG_EVENT_TYPE,
     InstallationNotBoundToGuild,
     RepositoryNotLinkedToGuild,
 )
@@ -297,6 +298,73 @@ class RepositoryIsolationTests(unittest.TestCase):
 
         self.assertIsNone(error)
         self.assertEqual(linked_repo, self.guild_a_repo)
+
+    def test_issue_settings_do_not_store_label_or_log_configuration(self) -> None:
+        settings = self.db.set_issue_settings(
+            GUILD_A,
+            "ownerA",
+            "repoA",
+            allowed_labels=("bug", "enhancement"),
+            default_labels=("bug",),
+            submission_log_channel_id=999,
+        )
+
+        self.assertEqual(settings.allowed_labels, ())
+        self.assertEqual(settings.default_labels, ())
+        self.assertIsNone(settings.submission_log_channel_id)
+        self.assertIsNone(self.db.get_log_channel(GUILD_A, ISSUE_SUBMISSIONS_LOG_EVENT_TYPE))
+
+    def test_legacy_issue_submission_log_channel_is_migrated_to_log_channels(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy-issue-log.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE guilds (
+                    guild_id INTEGER PRIMARY KEY,
+                    guild_name TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE log_channels (
+                    guild_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, event_type)
+                );
+                CREATE TABLE issue_settings (
+                    guild_id INTEGER PRIMARY KEY,
+                    default_owner TEXT,
+                    default_repo TEXT,
+                    suggestion_label TEXT NOT NULL DEFAULT 'suggestion',
+                    bug_label TEXT NOT NULL DEFAULT 'bug',
+                    allowed_labels TEXT NOT NULL DEFAULT '[]',
+                    default_labels TEXT NOT NULL DEFAULT '[]',
+                    submission_log_channel_id INTEGER,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO guilds (guild_id, guild_name) VALUES (1001, 'Guild A');
+                INSERT INTO issue_settings (guild_id, submission_log_channel_id)
+                VALUES (1001, 987654321);
+                """
+            )
+        finally:
+            connection.close()
+
+        migrated = Database(legacy_path)
+        try:
+            migrated.init()
+            self.assertEqual(
+                migrated.get_log_channel(GUILD_A, ISSUE_SUBMISSIONS_LOG_EVENT_TYPE),
+                987654321,
+            )
+            settings = migrated.get_issue_settings(GUILD_A)
+            self.assertIsNotNone(settings)
+            self.assertIsNone(settings.submission_log_channel_id)  # type: ignore[union-attr]
+        finally:
+            migrated.close()
 
     def test_selected_repo_overrides_default_repo_for_issue_creation(self) -> None:
         installation_c = 333
